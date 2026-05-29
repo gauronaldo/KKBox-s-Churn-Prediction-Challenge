@@ -1,0 +1,3 @@
+model,train_auc_roc,train_auc_pr,train_f1,train_precision,train_recall,train_lift_at_top10,val_auc_roc,val_auc_pr,val_f1,val_precision,val_recall,val_lift_at_top10,best_iteration,mlflow_run_id
+random_forest,0.999976,0.999571,0.998751,0.998269,0.999235,10.0,0.988067,0.881995,0.770734,0.845498,0.708119,9.6208,0,
+lightgbm,0.988696,0.849432,0.757331,0.626208,0.95791,9.6037,0.988165,0.846112,0.754048,0.622453,0.956202,9.5851,26,

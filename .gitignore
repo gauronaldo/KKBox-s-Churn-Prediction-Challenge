@@ -221,7 +221,7 @@ __marimo__/
 /data/
 
 # Model artifacts
-models/
+/models/
 
 # Python
 venv/

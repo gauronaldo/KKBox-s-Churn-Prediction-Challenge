@@ -1,8 +1,15 @@
-"""Feature engineering helpers for the KKBox churn project."""
+"""Feature engineering helpers for the KKBox churn project.
+
+This module transforms the merged modeling frame (produced by the ingestion
+stage) into a richer feature frame ready for model training.  All thresholds
+and configuration knobs are read from ``config.yaml`` — no magic numbers live
+here.
+"""
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -12,10 +19,34 @@ import pandas as pd
 
 from src.utils.config import get_value
 
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "FeatureFrameSummary",
+    "engineer_features",
+    "summarize_feature_frame",
+    "build_feature_frame",
+    "save_feature_summary",
+]
+
+
+# ---------------------------------------------------------------------------
+# Data class
+# ---------------------------------------------------------------------------
+
 
 @dataclass(slots=True)
 class FeatureFrameSummary:
-    """Lightweight summary of an engineered feature frame."""
+    """Lightweight summary of an engineered feature frame.
+
+    Attributes:
+        row_count: Total number of rows in the feature frame.
+        column_count: Total number of columns (original + derived).
+        numeric_features: List of numeric column names (excludes target).
+        categorical_features: List of categorical/string column names.
+        datetime_features: List of datetime column names.
+        derived_features: List of column names added by feature engineering.
+    """
 
     row_count: int
     column_count: int
@@ -25,48 +56,115 @@ class FeatureFrameSummary:
     derived_features: list[str]
 
 
-def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    """Divide two series while protecting against zero denominators."""
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
 
+
+def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """Divide two series while protecting against zero denominators.
+
+    Args:
+        numerator: The dividend series.
+        denominator: The divisor series.
+
+    Returns:
+        Element-wise quotient; zero denominators yield ``pd.NA``.
+    """
     denominator = denominator.replace(0, pd.NA)
     return numerator / denominator
 
 
 def _ensure_datetime(frame: pd.DataFrame, column: str) -> None:
-    """Convert a column to datetime when present."""
+    """Coerce a column to datetime in-place when it is present but not typed.
 
-    if column in frame.columns and not pd.api.types.is_datetime64_any_dtype(frame[column]):
+    Args:
+        frame: The DataFrame to modify in-place.
+        column: Column name to convert.
+    """
+    if column in frame.columns and not pd.api.types.is_datetime64_any_dtype(
+        frame[column]
+    ):
         frame[column] = pd.to_datetime(frame[column], errors="coerce")
+        logger.debug("Coerced column '%s' to datetime.", column)
 
 
-def _reference_date(frame: pd.DataFrame, columns: list[str]) -> pd.Timestamp | pd.NaT:
-    """Compute a stable reference date from available datetime columns."""
+def _reference_date(
+    frame: pd.DataFrame, columns: list[str]
+) -> pd.Timestamp | None:
+    """Compute a stable reference date from the latest observed datetime.
 
+    Using the maximum observed date (rather than ``datetime.now()``) ensures
+    full reproducibility when re-running the pipeline on static snapshots.
+
+    Args:
+        frame: DataFrame containing the candidate datetime columns.
+        columns: Ordered list of column names to inspect.
+
+    Returns:
+        The maximum valid timestamp found, or ``None`` if none exist.
+    """
     dates: list[pd.Timestamp] = []
     for column in columns:
-        if column in frame.columns and pd.api.types.is_datetime64_any_dtype(frame[column]):
+        if column in frame.columns and pd.api.types.is_datetime64_any_dtype(
+            frame[column]
+        ):
             series_max = frame[column].max()
             if pd.notna(series_max):
                 dates.append(series_max)
     if not dates:
-        return pd.NaT
-    return max(dates)
+        logger.warning(
+            "No valid datetime columns found in %s; reference date is None.",
+            columns,
+        )
+        return None
+    ref = max(dates)
+    logger.debug("Reference date resolved to %s.", ref)
+    return ref
 
 
-def _categorize_age(age_series: pd.Series, age_min: int, age_max: int) -> pd.Series:
-    """Create a coarse age band from a cleaned age series."""
+def _categorize_age(
+    age_series: pd.Series, age_min: int, age_max: int
+) -> pd.Series:
+    """Bin a cleaned age series into coarse demographic bands.
 
+    Coarse bands reduce sensitivity to individual age noise while preserving
+    the non-linear relationship between age and churn propensity.
+
+    Args:
+        age_series: Numeric age values (already cleaned / out-of-range → NaN).
+        age_min: Minimum valid age (values below are already NaN).
+        age_max: Maximum valid age used as the final bin boundary.
+
+    Returns:
+        String-typed Series with labels such as ``"18-24"`` or ``"65+"``.
+    """
     bins = [0, 17, 24, 34, 44, 54, 64, age_max]
     labels = ["<18", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
-    age_band = pd.cut(age_series, bins=bins, labels=labels, include_lowest=True, right=True)
+    age_band = pd.cut(
+        age_series,
+        bins=bins,
+        labels=labels,
+        include_lowest=True,
+        right=True,
+    )
     return age_band.astype("string")
 
 
 def _normalize_gender(series: pd.Series) -> pd.Series:
-    """Normalize gender labels into a small set of values."""
+    """Normalize raw gender values into a canonical three-way vocabulary.
 
+    Handles abbreviated, full, and unknown representations so downstream
+    one-hot encoding sees a stable, finite category set.
+
+    Args:
+        series: Raw gender column from the members table.
+
+    Returns:
+        String series containing only ``"male"``, ``"female"``, or ``"unknown"``.
+    """
     normalized = series.astype("string").str.strip().str.lower()
-    replacements = {
+    replacements: dict[str, str] = {
         "m": "male",
         "f": "female",
         "male": "male",
@@ -79,191 +177,418 @@ def _normalize_gender(series: pd.Series) -> pd.Series:
     return normalized.fillna("unknown")
 
 
-def _add_missing_indicators(frame: pd.DataFrame, columns: list[str]) -> list[str]:
-    """Add boolean missing indicators for the specified columns."""
+def _add_missing_indicators(
+    frame: pd.DataFrame, columns: list[str]
+) -> list[str]:
+    """Add binary missing-value indicators for the specified columns in-place.
 
+    Missing indicators allow tree-based models to learn imputation patterns
+    and give linear models an explicit signal for data absence.
+
+    Args:
+        frame: DataFrame to augment in-place.
+        columns: Columns for which to create ``<col>_missing`` indicators.
+
+    Returns:
+        Names of the newly created indicator columns.
+    """
     created_columns: list[str] = []
     for column in columns:
         if column in frame.columns:
             indicator_name = f"{column}_missing"
             frame[indicator_name] = frame[column].isna().astype("int8")
             created_columns.append(indicator_name)
+    if created_columns:
+        logger.debug(
+            "Created %d missing-value indicators: %s",
+            len(created_columns),
+            created_columns,
+        )
     return created_columns
 
 
 def _log1p_safe(series: pd.Series) -> pd.Series:
-    """Apply log1p after clipping negative values to zero."""
+    """Apply ``log1p`` after clipping negative values to zero.
 
+    Negative values can appear from aggregation rounding; clipping avoids
+    ``NaN`` propagation without masking genuine data errors.
+
+    Args:
+        series: Numeric series to transform.
+
+    Returns:
+        Log1p-transformed series.
+    """
     return np.log1p(series.clip(lower=0))
 
 
-def engineer_features(frame: pd.DataFrame, config: Mapping[str, Any]) -> pd.DataFrame:
+def _get_column_safe(
+    frame: pd.DataFrame, column: str, dtype: str = "float64"
+) -> pd.Series:
+    """Return a column if present, otherwise an all-NA series of the given dtype.
+
+    Using an explicit fallback Series (rather than ``DataFrame.get()``) ensures
+    that safe-divide operations always receive a properly indexed Series.
+
+    Args:
+        frame: Source DataFrame.
+        column: Column name to retrieve.
+        dtype: NumPy dtype string for the fallback Series.
+
+    Returns:
+        The column Series or a same-index all-NA Series.
+    """
+    if column in frame.columns:
+        return frame[column]
+    return pd.Series(index=frame.index, dtype=dtype, name=column)
+
+
+# ---------------------------------------------------------------------------
+# Core feature engineering
+# ---------------------------------------------------------------------------
+
+
+def engineer_features(
+    frame: pd.DataFrame, config: Mapping[str, Any]
+) -> pd.DataFrame:
     """Create model-ready features from the merged KKBox analysis frame.
+
+    Feature groups applied (each guarded by column availability):
+
+    1. **Datetime coercion** — ensures all date columns are proper timestamps.
+    2. **Membership tenure** — days since registration; registration calendar
+       components (year, month, day-of-week).
+    3. **Demographics** — cleaned age, age band, gender normalization, profile
+       completeness score.
+    4. **Transaction aggregates** — spend per transaction, transaction rate,
+       mean discount amount, retention rate from cancellation history.
+    5. **Listening behavior** — listen event totals, completion share, unique
+       track share, seconds per active day, events per active day.
+    6. **Cross-source ratios** — usage-to-spend ratio, activity gap between
+       last log and last transaction.
+    7. **Recency flags** — binary flags for activity within the rolling window
+       configured by ``feature_engineering.recent_days_window``.
+    8. **Missing indicators** — binary columns flagging NaN presence.
+    9. **Log-scale transforms** — applied to high-skew columns listed in
+       ``feature_engineering.log_scale_features``.
 
     Args:
         frame: Merged modeling frame produced by the ingestion stage.
-        config: Parsed project configuration.
+        config: Parsed project configuration (from ``config.yaml``).
 
     Returns:
-        A copy of the frame with additional engineered features.
-    """
+        A copy of the input frame enriched with all engineered features.
 
+    Raises:
+        KeyError: If the ``msno`` identifier column is absent from ``frame``.
+    """
     if "msno" not in frame.columns:
         raise KeyError("The modeling frame must contain an 'msno' column.")
 
     df = frame.copy()
+    original_columns: set[str] = set(df.columns)
 
-    age_min = int(get_value(config, "feature_engineering", "age_min", default=7))
-    age_max = int(get_value(config, "feature_engineering", "age_max", default=70))
-    recent_days_window = int(get_value(config, "feature_engineering", "recent_days_window", default=30))
-    log_scale_features = list(get_value(config, "feature_engineering", "log_scale_features", default=[]))
+    # --- Read config knobs ---------------------------------------------------
+    age_min: int = int(
+        get_value(config, "feature_engineering", "age_min", default=7)
+    )
+    age_max: int = int(
+        get_value(config, "feature_engineering", "age_max", default=70)
+    )
+    recent_days_window: int = int(
+        get_value(
+            config, "feature_engineering", "recent_days_window", default=30
+        )
+    )
+    log_scale_features: list[str] = list(
+        get_value(
+            config, "feature_engineering", "log_scale_features", default=[]
+        )
+    )
 
-    datetime_columns = ["registration_init_time", "last_transaction_date", "last_expire_date", "last_log_date"]
+    logger.info(
+        "Starting feature engineering | age_min=%d, age_max=%d, "
+        "recent_window=%d days, log_features=%s",
+        age_min,
+        age_max,
+        recent_days_window,
+        log_scale_features,
+    )
+
+    # -------------------------------------------------------------------------
+    # 1. Datetime coercion
+    # -------------------------------------------------------------------------
+    datetime_columns = [
+        "registration_init_time",
+        "last_transaction_date",
+        "last_expire_date",
+        "last_log_date",
+    ]
     for column in datetime_columns:
         _ensure_datetime(df, column)
 
     reference_date = _reference_date(df, datetime_columns)
-    if pd.notna(reference_date):
+    if reference_date is not None:
+        # Store as a scalar column so downstream code can audit the snapshot.
         df["analysis_reference_date"] = reference_date
 
-    derived_columns: list[str] = []
-
+    # -------------------------------------------------------------------------
+    # 2. Membership tenure features
+    # -------------------------------------------------------------------------
     if "registration_init_time" in df.columns:
-        if pd.notna(reference_date):
-            df["member_age_days"] = (reference_date - df["registration_init_time"]).dt.days
-            derived_columns.append("member_age_days")
+        if reference_date is not None:
+            df["member_age_days"] = (
+                reference_date - df["registration_init_time"]
+            ).dt.days
+            logger.debug("Computed 'member_age_days'.")
+
         df["registration_year"] = df["registration_init_time"].dt.year
         df["registration_month"] = df["registration_init_time"].dt.month
-        df["registration_dayofweek"] = df["registration_init_time"].dt.dayofweek
-        derived_columns.extend(["registration_year", "registration_month", "registration_dayofweek"])
+        # Day-of-week (0=Mon, 6=Sun) can capture user acquisition cohort bias.
+        df["registration_dayofweek"] = (
+            df["registration_init_time"].dt.dayofweek
+        )
+        logger.debug(
+            "Computed registration calendar features "
+            "(year, month, day-of-week)."
+        )
 
+    # -------------------------------------------------------------------------
+    # 3. Demographics
+    # -------------------------------------------------------------------------
     if "bd" in df.columns:
         age_raw = pd.to_numeric(df["bd"], errors="coerce")
+        # Clip implausible ages to NaN; these are common in KKBox (0, 999, etc.)
         age_clean = age_raw.where(age_raw.between(age_min, age_max))
         df["bd_clean"] = age_clean
         df["bd_age_valid"] = age_clean.notna().astype("int8")
         df["age_band"] = _categorize_age(age_clean, age_min, age_max)
-        derived_columns.extend(["bd_clean", "bd_age_valid", "age_band"])
+        logger.debug(
+            "Age cleaning: %d valid ages out of %d total.",
+            int(age_clean.notna().sum()),
+            len(age_clean),
+        )
 
     if "gender" in df.columns:
         df["gender_clean"] = _normalize_gender(df["gender"])
-        derived_columns.append("gender_clean")
+        logger.debug("Normalized 'gender' → 'gender_clean'.")
 
-    if {"city", "registered_via"}.intersection(df.columns):
-        profile_columns = [column for column in ["bd", "gender", "city", "registered_via"] if column in df.columns]
-        if profile_columns:
-            observed = pd.DataFrame(index=df.index)
-            for column in profile_columns:
-                observed[column] = df[column].notna().astype("int8")
-            df["profile_completeness"] = observed.mean(axis=1)
-            derived_columns.append("profile_completeness")
+    profile_columns = [
+        c for c in ["bd", "gender", "city", "registered_via"] if c in df.columns
+    ]
+    if profile_columns:
+        # Profile completeness: fraction of demographic fields that are non-null.
+        # Low completeness is a proxy for low engagement with registration flow.
+        observed = pd.DataFrame(
+            {c: df[c].notna().astype("int8") for c in profile_columns}
+        )
+        df["profile_completeness"] = observed.mean(axis=1)
+        logger.debug(
+            "Computed 'profile_completeness' from %d fields.", len(profile_columns)
+        )
 
+    # -------------------------------------------------------------------------
+    # 4. Transaction aggregate features
+    # -------------------------------------------------------------------------
     if {"trans_count", "total_spend"}.issubset(df.columns):
-        df["spend_per_transaction"] = _safe_divide(df["total_spend"], df["trans_count"])
-        df["transactions_per_member_day"] = _safe_divide(df["trans_count"], df.get("member_age_days", pd.Series(index=df.index, dtype="float64")))
-        df["mean_discount_amount"] = df.get("mean_plan_price", 0) - df.get("mean_spend", 0)
-        derived_columns.extend(["spend_per_transaction", "transactions_per_member_day", "mean_discount_amount"])
+        df["spend_per_transaction"] = _safe_divide(
+            df["total_spend"], df["trans_count"]
+        )
+        df["transactions_per_member_day"] = _safe_divide(
+            df["trans_count"],
+            _get_column_safe(df, "member_age_days"),
+        )
+        # Mean discount amount = list price minus actual paid; negative means
+        # the user paid more than list (rare but possible with KKBox promotions).
+        df["mean_discount_amount"] = _get_column_safe(
+            df, "mean_plan_price"
+        ).fillna(0) - _get_column_safe(df, "mean_spend").fillna(0)
+        logger.debug(
+            "Computed transaction ratio features "
+            "(spend_per_transaction, transactions_per_member_day, "
+            "mean_discount_amount)."
+        )
 
     if "cancel_rate" in df.columns:
-        df["retention_rate_from_transactions"] = 1 - df["cancel_rate"].fillna(0)
-        derived_columns.append("retention_rate_from_transactions")
+        # Retention rate is the complement of cancel rate; more intuitive for
+        # business stakeholders and useful as a direct churn predictor.
+        df["retention_rate_from_transactions"] = (
+            1 - df["cancel_rate"].fillna(0)
+        )
+        logger.debug("Computed 'retention_rate_from_transactions'.")
 
-    if {"total_25", "total_50", "total_75", "total_985", "total_100"}.issubset(df.columns):
-        listen_events = df[["total_25", "total_50", "total_75", "total_985", "total_100"]].fillna(0).sum(axis=1)
+    # -------------------------------------------------------------------------
+    # 5. Listening behavior features
+    # -------------------------------------------------------------------------
+    listen_cols = {"total_25", "total_50", "total_75", "total_985", "total_100"}
+    if listen_cols.issubset(df.columns):
+        listen_events = df[list(listen_cols)].fillna(0).sum(axis=1)
         df["listen_events_total"] = listen_events
-        df["listen_completion_share"] = _safe_divide(df["total_100"], listen_events)
-        df["listen_unique_share"] = _safe_divide(df.get("total_unq", pd.Series(index=df.index, dtype="float64")), listen_events)
-        derived_columns.extend(["listen_events_total", "listen_completion_share", "listen_unique_share"])
+
+        df["listen_completion_share"] = _safe_divide(
+            df["total_100"], listen_events
+        )
+        df["listen_unique_share"] = _safe_divide(
+            _get_column_safe(df, "total_unq"), listen_events
+        )
+        logger.debug(
+            "Computed listening event features "
+            "(listen_events_total, listen_completion_share, "
+            "listen_unique_share)."
+        )
 
     if {"total_secs", "active_days"}.issubset(df.columns):
-        df["secs_per_active_day"] = _safe_divide(df["total_secs"], df["active_days"])
-        derived_columns.append("secs_per_active_day")
+        # Seconds per active day measures session depth, not just frequency.
+        df["secs_per_active_day"] = _safe_divide(
+            df["total_secs"], df["active_days"]
+        )
+        logger.debug("Computed 'secs_per_active_day'.")
 
     if {"listen_events_total", "active_days"}.issubset(df.columns):
-        df["events_per_active_day"] = _safe_divide(df["listen_events_total"], df["active_days"])
-        derived_columns.append("events_per_active_day")
+        df["events_per_active_day"] = _safe_divide(
+            df["listen_events_total"], df["active_days"]
+        )
+        logger.debug("Computed 'events_per_active_day'.")
 
+    # -------------------------------------------------------------------------
+    # 6. Cross-source ratio features
+    # -------------------------------------------------------------------------
     if {"total_secs", "total_spend"}.issubset(df.columns):
-        df["usage_to_spend_ratio"] = _safe_divide(df["total_secs"], df["total_spend"])
-        derived_columns.append("usage_to_spend_ratio")
+        # Usage-to-spend ratio captures value perception: high listening + low
+        # spend may signal a free-rider; low listening + high spend may churn.
+        df["usage_to_spend_ratio"] = _safe_divide(
+            df["total_secs"], df["total_spend"]
+        )
+        logger.debug("Computed 'usage_to_spend_ratio'.")
 
-    if {"days_since_last_transaction", "days_since_last_log"}.issubset(df.columns):
-        df["recent_activity_gap"] = df["days_since_last_log"] - df["days_since_last_transaction"]
-        derived_columns.append("recent_activity_gap")
+    if {"days_since_last_transaction", "days_since_last_log"}.issubset(
+        df.columns
+    ):
+        # Positive gap = user listened more recently than they transacted
+        # (healthy). Negative = last transaction is more recent than last listen
+        # (potential churn signal).
+        df["recent_activity_gap"] = (
+            df["days_since_last_log"] - df["days_since_last_transaction"]
+        )
+        logger.debug("Computed 'recent_activity_gap'.")
 
+    # -------------------------------------------------------------------------
+    # 7. Recency flags
+    # -------------------------------------------------------------------------
     if "days_since_last_transaction" in df.columns:
-        df["recent_transaction_flag"] = (df["days_since_last_transaction"] <= recent_days_window).astype("int8")
-        derived_columns.append("recent_transaction_flag")
+        df["recent_transaction_flag"] = (
+            df["days_since_last_transaction"] <= recent_days_window
+        ).astype("int8")
+        logger.debug(
+            "Created 'recent_transaction_flag' (window=%d days).",
+            recent_days_window,
+        )
 
     if "days_since_last_log" in df.columns:
-        df["recent_usage_flag"] = (df["days_since_last_log"] <= recent_days_window).astype("int8")
-        derived_columns.append("recent_usage_flag")
+        df["recent_usage_flag"] = (
+            df["days_since_last_log"] <= recent_days_window
+        ).astype("int8")
+        logger.debug(
+            "Created 'recent_usage_flag' (window=%d days).",
+            recent_days_window,
+        )
 
-    missing_indicators = _add_missing_indicators(
+    # -------------------------------------------------------------------------
+    # 8. Missing-value indicators
+    # -------------------------------------------------------------------------
+    _add_missing_indicators(
         df,
-        ["bd", "gender", "registered_via", "registration_init_time", "last_transaction_date", "last_expire_date", "last_log_date"],
+        [
+            "bd",
+            "gender",
+            "registered_via",
+            "registration_init_time",
+            "last_transaction_date",
+            "last_expire_date",
+            "last_log_date",
+        ],
     )
-    derived_columns.extend(missing_indicators)
 
+    # -------------------------------------------------------------------------
+    # 9. Log-scale transforms
+    # -------------------------------------------------------------------------
     for column in log_scale_features:
         if column in df.columns:
-            df[f"{column}_log1p"] = _log1p_safe(pd.to_numeric(df[column], errors="coerce").fillna(0))
-            derived_columns.append(f"{column}_log1p")
+            log_col = f"{column}_log1p"
+            df[log_col] = _log1p_safe(
+                pd.to_numeric(df[column], errors="coerce").fillna(0)
+            )
+            logger.debug(
+                "Applied log1p transform: '%s' → '%s'.", column, log_col
+            )
 
-    numeric_candidates = [
-        "bd",
-        "bd_clean",
-        "profile_completeness",
-        "trans_count",
-        "total_spend",
-        "mean_spend",
-        "max_spend",
-        "cancel_count",
-        "cancel_rate",
-        "auto_renew_rate",
-        "mean_plan_days",
-        "mean_plan_price",
-        "mean_discount_rate",
-        "days_since_last_transaction",
-        "days_since_last_log",
-        "active_days",
-        "total_secs",
-        "mean_secs",
-        "total_unq",
-        "mean_unq",
-        "mean_completion_rate",
-        "member_age_days",
-        "spend_per_transaction",
-        "transactions_per_member_day",
-        "mean_discount_amount",
-        "retention_rate_from_transactions",
-        "listen_events_total",
-        "listen_completion_share",
-        "listen_unique_share",
-        "secs_per_active_day",
-        "events_per_active_day",
-        "usage_to_spend_ratio",
-        "recent_activity_gap",
-    ]
-    for column in numeric_candidates:
-        if column in df.columns and pd.api.types.is_bool_dtype(df[column]):
-            df[column] = df[column].astype("int8")
+    # -------------------------------------------------------------------------
+    # Summary log
+    # -------------------------------------------------------------------------
+    derived_columns = sorted(set(df.columns) - original_columns)
+    logger.info(
+        "Feature engineering complete | %d new columns added: %s",
+        len(derived_columns),
+        derived_columns,
+    )
 
-    logger_columns = [column for column in derived_columns if column in df.columns]
     return df
 
 
-def summarize_feature_frame(frame: pd.DataFrame) -> FeatureFrameSummary:
-    """Summarize the engineered feature frame for metadata output."""
+# ---------------------------------------------------------------------------
+# Summary and persistence helpers
+# ---------------------------------------------------------------------------
 
-    numeric_features = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column]) and column not in {"is_churn"}]
-    categorical_features = [
-        column
-        for column in frame.columns
-        if pd.api.types.is_object_dtype(frame[column]) or pd.api.types.is_string_dtype(frame[column]) or pd.api.types.is_categorical_dtype(frame[column])
+
+def summarize_feature_frame(frame: pd.DataFrame) -> FeatureFrameSummary:
+    """Summarize the engineered feature frame for metadata output.
+
+    Args:
+        frame: The fully engineered feature DataFrame.
+
+    Returns:
+        A ``FeatureFrameSummary`` capturing column counts and lists by dtype.
+    """
+    # Exclude the target and ID columns from feature lists.
+    non_feature: set[str] = {"msno", "is_churn", "analysis_reference_date"}
+
+    numeric_features = [
+        c
+        for c in frame.columns
+        if pd.api.types.is_numeric_dtype(frame[c]) and c not in non_feature
     ]
-    datetime_features = [column for column in frame.columns if pd.api.types.is_datetime64_any_dtype(frame[column])]
-    derived_features = [column for column in frame.columns if column not in {"msno", "is_churn"}]
+    categorical_features = [
+        c
+        for c in frame.columns
+        if (
+            pd.api.types.is_object_dtype(frame[c])
+            or pd.api.types.is_string_dtype(frame[c])
+            # Use isinstance check to avoid deprecated is_categorical_dtype.
+            or isinstance(frame[c].dtype, pd.CategoricalDtype)
+        )
+        and c not in non_feature
+    ]
+    datetime_features = [
+        c
+        for c in frame.columns
+        if pd.api.types.is_datetime64_any_dtype(frame[c])
+    ]
+    # Derived features = everything that is not the raw ID or target.
+    derived_features = [
+        c for c in frame.columns if c not in non_feature
+    ]
+
+    logger.info(
+        "Frame summary | rows=%d, cols=%d, numeric=%d, "
+        "categorical=%d, datetime=%d, derived=%d",
+        frame.shape[0],
+        frame.shape[1],
+        len(numeric_features),
+        len(categorical_features),
+        len(datetime_features),
+        len(derived_features),
+    )
+
     return FeatureFrameSummary(
         row_count=int(frame.shape[0]),
         column_count=int(frame.shape[1]),
@@ -274,19 +599,35 @@ def summarize_feature_frame(frame: pd.DataFrame) -> FeatureFrameSummary:
     )
 
 
-def build_feature_frame(frame: pd.DataFrame, config: Mapping[str, Any]) -> tuple[pd.DataFrame, FeatureFrameSummary]:
-    """Build the final feature frame and its metadata summary."""
+def build_feature_frame(
+    frame: pd.DataFrame, config: Mapping[str, Any]
+) -> tuple[pd.DataFrame, FeatureFrameSummary]:
+    """Build the final feature frame and its metadata summary.
 
+    This is the single public entrypoint intended for use by the pipeline
+    orchestrator (``pipeline.py``).
+
+    Args:
+        frame: Merged modeling frame from the ingestion stage.
+        config: Parsed project configuration.
+
+    Returns:
+        A tuple of ``(engineered_frame, summary)``.
+    """
     engineered = engineer_features(frame, config)
     summary = summarize_feature_frame(engineered)
     return engineered, summary
 
 
 def save_feature_summary(summary: FeatureFrameSummary, path: Path) -> None:
-    """Persist a feature summary as JSON."""
+    """Persist a ``FeatureFrameSummary`` as a human-readable JSON file.
 
+    Args:
+        summary: The summary dataclass to serialise.
+        path: Destination file path (parent directories are created if absent).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    payload: dict[str, Any] = {
         "row_count": summary.row_count,
         "column_count": summary.column_count,
         "numeric_features": summary.numeric_features,
@@ -294,4 +635,7 @@ def save_feature_summary(summary: FeatureFrameSummary, path: Path) -> None:
         "datetime_features": summary.datetime_features,
         "derived_features": summary.derived_features,
     }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8"
+    )
+    logger.info("Feature summary written to %s.", path)
