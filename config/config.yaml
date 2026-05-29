@@ -1,0 +1,111 @@
+project:
+  name: kkbox-churn-prediction
+  random_state: 42
+  target_col: is_churn
+  id_col: msno
+
+paths:
+  data_dir: data
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+  models_dir: models
+  reports_dir: reports
+  figures_dir: reports/figures
+  notebooks_dir: notebooks
+  logs_dir: logs
+
+data_files:
+  train: train.csv
+  members: members_v3.csv
+  transactions: transactions.csv
+  user_logs: user_logs.csv
+  sample_submission: sample_submission.csv
+
+data_validation:
+  required_train_columns:
+    - msno
+    - is_churn
+  required_members_columns:
+    - msno
+    - city
+    - bd
+    - gender
+    - registered_via
+    - registration_init_time
+  required_transactions_columns:
+    - msno
+    - transaction_date
+    - membership_expire_date
+    - is_cancel
+    - payment_plan_days
+    - plan_list_price
+    - actual_amount_paid
+    - is_auto_renew
+  required_user_logs_columns:
+    - msno
+    - date
+    - num_25
+    - num_50
+    - num_75
+    - num_985
+    - num_100
+    - num_unq
+    - total_secs
+
+split:
+  validation_size: 0.2
+  stratify: true
+
+ingestion:
+  chunksize: 500000
+
+feature_engineering:
+  age_min: 7
+  age_max: 70
+  recent_days_window: 30
+  log_scale_features:
+    - total_secs
+    - num_unq
+    - num_100
+    - num_25
+
+modeling:
+  baseline_model: logistic_regression
+  candidate_models:
+    - logistic_regression
+    - random_forest
+    - lightgbm
+  champion_metric: auc_pr
+  decision_threshold: 0.5
+
+logistic_regression:
+  solver: lbfgs
+  max_iter: 1000
+  class_weight: balanced
+
+random_forest:
+  n_estimators: 300
+  max_depth: null
+  min_samples_split: 2
+  min_samples_leaf: 1
+  n_jobs: -1
+
+lightgbm:
+  n_estimators: 500
+  learning_rate: 0.05
+  num_leaves: 31
+  max_depth: -1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  class_weight: balanced
+
+optuna:
+  n_trials: 50
+  timeout: null
+  direction: maximize
+  metric: auc_pr
+
+mlflow:
+  experiment_name: kkbox-churn-prediction
+  tracking_uri: null
