@@ -64,6 +64,8 @@ feature_engineering:
   age_min: 7
   age_max: 70
   recent_days_window: 30
+  output_file: feature_frame.parquet
+  metadata_file: feature_metadata.json
   log_scale_features:
     - total_secs
     - num_unq
