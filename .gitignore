@@ -236,3 +236,10 @@ Thumbs.db
 
 # MLflow
 mlruns/
+mlflow.db
+
+# Logs
+logs/
+
+# Output artifacts
+output/

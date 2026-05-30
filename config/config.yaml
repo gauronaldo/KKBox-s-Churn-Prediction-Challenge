@@ -54,8 +54,8 @@ data_validation:
     - total_secs
 
 split:
-  validation_size: 0.15   
-  test_size: 0.15         
+  validation_size: 0.15
+  test_size: 0.15
   stratify: true
 
 ingestion:
@@ -65,6 +65,12 @@ feature_engineering:
   age_min: 7
   age_max: 70
   recent_days_window: 30
+  # Cutoff date: ALL transactions and logs AFTER this date are excluded.
+  # Must be BEFORE the churn observation window begins.
+  # KKBox cohort: memberships expire Feb-Mar 2017 → cutoff = Jan 31, 2017.
+  # Using data from the observation window (Feb-Mar 2017) leaks the churn
+  # label because non-churners create renewal transactions in that period.
+  cutoff_date: "2017-01-31"
   output_file: feature_frame.parquet
   metadata_file: feature_metadata.json
   log_scale_features:
@@ -74,36 +80,55 @@ feature_engineering:
     - num_25
 
 modeling:
-  baseline_model: logistic_regression
   candidate_models:
     - logistic_regression
     - random_forest
+    - xgboost
     - lightgbm
   champion_metric: auc_pr
   decision_threshold: 0.5
 
+# ── Model hyperparameters ───────────────────────────────────────────────────
+# scale_pos_weight (xgboost, lightgbm) is computed dynamically as n_neg/n_pos.
+# class_weight (logistic_regression, random_forest) is set to "balanced".
+
 logistic_regression:
   solver: lbfgs
   max_iter: 1000
-  class_weight: balanced
+  class_weight: balanced    # sklearn handles imbalance via class weights
+
+xgboost:
+  n_estimators: 1000
+  learning_rate: 0.03
+  max_depth: 6
+  subsample: 0.8
+  colsample_bytree: 0.8
+  tree_method: hist
+  eval_metric: aucpr
+  early_stopping_rounds: 100
+  log_eval_period: 100
+
+lightgbm:
+  metric: auc                 # early stopping monitors AUC-ROC (stable, higher=better)
+  n_estimators: 1000
+  learning_rate: 0.03
+  num_leaves: 31
+  max_depth: -1
+  min_child_samples: 50       # regularisation: min samples per leaf
+  reg_alpha: 0.1              # L1 regularisation
+  reg_lambda: 1.0             # L2 regularisation
+  subsample: 0.8
+  colsample_bytree: 0.8
+  early_stopping_rounds: 100
+  log_eval_period: 100
 
 random_forest:
   n_estimators: 300
-  max_depth: null
+  max_depth: 20
   min_samples_split: 2
-  min_samples_leaf: 1
+  min_samples_leaf: 10
   n_jobs: -1
-
-lightgbm:
-  n_estimators: 500
-  learning_rate: 0.05
-  num_leaves: 31
-  max_depth: -1
-  subsample: 0.8
-  colsample_bytree: 0.8
   class_weight: balanced
-  early_stopping_rounds: 100 
-  log_eval_period: 50 
 
 optuna:
   n_trials: 50

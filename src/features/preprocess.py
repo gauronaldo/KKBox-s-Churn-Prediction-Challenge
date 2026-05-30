@@ -86,6 +86,12 @@ def _sanitise_for_sklearn(df: pd.DataFrame) -> pd.DataFrame:
     as the missing-value sentinel. This function converts those columns to
     plain numpy object arrays where missing values become ``np.nan``.
 
+    Also handles ``object``-dtype columns that contain a mix of ``pd.NA``
+    and numeric/string values — these arise when engineer.py combines a
+    nullable Series with a float column via assignment.  sklearn's
+    OrdinalEncoder calls ``sorted()`` on the unique values, which raises
+    ``TypeError: boolean value of NA is ambiguous`` if ``pd.NA`` is present.
+
     Args:
         df: Input DataFrame potentially containing pandas extension dtypes.
 
@@ -98,7 +104,7 @@ def _sanitise_for_sklearn(df: pd.DataFrame) -> pd.DataFrame:
         dtype = out[col].dtype
 
         if isinstance(dtype, pd.StringDtype):
-            # to_numpy(na_value=np.nan) replaces pd.NA → np.nan correctly.
+            # to_numpy(na_value=np.nan) replaces pd.NA with np.nan correctly.
             # astype(object) alone keeps pd.NA as pd.NA, which is wrong.
             out[col] = out[col].to_numpy(dtype=object, na_value=np.nan)
 
@@ -108,6 +114,12 @@ def _sanitise_for_sklearn(df: pd.DataFrame) -> pd.DataFrame:
         elif isinstance(dtype, pd.BooleanDtype):
             # BooleanDtype also uses pd.NA; convert to float so np.nan works.
             out[col] = out[col].to_numpy(dtype=float, na_value=np.nan)
+
+        elif pd.api.types.is_object_dtype(dtype) and out[col].isna().any():
+            # object columns can contain pd.NA mixed with float/string values.
+            # to_numpy with na_value=np.nan replaces ALL NA sentinels
+            # (pd.NA, None, np.nan) uniformly so sklearn sees a clean array.
+            out[col] = out[col].to_numpy(dtype=object, na_value=np.nan)
 
     return out
 
@@ -332,7 +344,7 @@ def split_dataset(
     )
 
     logger.info(
-        "Dataset split | total=%d → train=%d (%.1f%%), "
+        "Dataset split | total=%d -> train=%d (%.1f%%), "
         "val=%d (%.1f%%), test=%d (%.1f%%)",
         len(frame),
         len(train_df), 100 * len(train_df) / len(frame),
@@ -432,9 +444,55 @@ def build_preprocessor(groups: ColumnGroups) -> ColumnTransformer:
     )
     return preprocessor
 
-from sklearn.preprocessing import OneHotEncoder   # thêm import
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import FunctionTransformer
 
-def build_linear_preprocessor(groups: ColumnGroups) -> ColumnTransformer:
+
+def _to_str_array(X) -> np.ndarray:
+    """Coerce a 2-D object array/DataFrame to uniform string + np.nan.
+
+    ``identify_column_groups`` classifies any object-dtype column as
+    categorical.  However, engineer.py can produce columns whose object
+    array contains a mix of str values **and** actual float values (not just
+    np.nan).  When that data enters ``OneHotEncoder``, sklearn calls
+    ``sorted()`` on the unique values which raises::
+
+        TypeError: '<' not supported between instances of 'str' and 'float'
+
+    This transformer runs before ``SimpleImputer`` to ensure every
+    non-null entry is a Python ``str``.  Null entries (np.nan, None,
+    pd.NA) are preserved as ``np.nan`` so ``SimpleImputer`` can later
+    fill them with ``"__missing__"``.
+
+    Note: ``FunctionTransformer(validate=False)`` passes the raw input
+    (which may be a pandas DataFrame, not a numpy array) directly.  We
+    normalise to a numpy object array first to avoid 2-D boolean-index
+    assignment errors that occur on DataFrames.
+    """
+    # Normalise to numpy object array regardless of input type
+    if hasattr(X, "to_numpy"):
+        arr = X.to_numpy(dtype=object, na_value=np.nan)
+    else:
+        arr = np.asarray(X, dtype=object)
+
+    mask = pd.isnull(arr)          # 2-D boolean: True where value is NA-like
+
+    # Step 1: convert everything to str (np.nan → "nan" as a side-effect)
+    str_arr = np.vectorize(str)(arr)
+
+    # Step 2: build output and restore NA positions
+    out = np.empty(arr.shape, dtype=object)
+    out[:] = str_arr               # all positions get their str representation
+    out[mask] = np.nan             # scalar assignment to 2-D mask — always safe
+
+    return out
+
+
+def build_linear_preprocessor(
+    groups: ColumnGroups,
+    X_ref: "pd.DataFrame | None" = None,
+    max_ohe_categories: int = 50,
+) -> ColumnTransformer:
     """Construct a preprocessor suited for linear models (Logistic Regression).
 
     Linear models require proper categorical encoding — OrdinalEncoder imposes
@@ -444,10 +502,44 @@ def build_linear_preprocessor(groups: ColumnGroups) -> ColumnTransformer:
 
     Args:
         groups: Column categorisation from ``identify_column_groups()``.
+        X_ref: Optional reference DataFrame used to measure cardinality of
+            categorical columns before building the pipeline.  Any column
+            with more than ``max_ohe_categories`` unique non-null values is
+            silently dropped from the categorical pipeline.  This prevents
+            numeric columns accidentally stored as ``object`` dtype (e.g.
+            continuous floats) from exploding the OHE output into millions
+            of columns.
+        max_ohe_categories: Upper bound on unique categories allowed for
+            OneHotEncoding.  Columns exceeding this limit are excluded.
+            Default: 50.
 
     Returns:
         An unfitted ``ColumnTransformer`` for linear models.
     """
+    # ── Cardinality guard ─────────────────────────────────────────────────────
+    safe_categorical = groups.categorical
+    if X_ref is not None and groups.categorical:
+        safe_categorical = []
+        dropped_high_card = []
+        for col in groups.categorical:
+            if col not in X_ref.columns:
+                continue
+            n_unique = int(X_ref[col].nunique(dropna=True))
+            if n_unique <= max_ohe_categories:
+                safe_categorical.append(col)
+            else:
+                dropped_high_card.append((col, n_unique))
+        if dropped_high_card:
+            logger.warning(
+                "Dropping %d high-cardinality columns from linear categorical "
+                "pipeline (max_ohe_categories=%d). These are likely numeric "
+                "columns stored as object dtype: %s",
+                len(dropped_high_card),
+                max_ohe_categories,
+                [(c, n) for c, n in dropped_high_card],
+            )
+
+    # ── Pipelines ─────────────────────────────────────────────────────────────
     numeric_pipeline = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
@@ -457,16 +549,23 @@ def build_linear_preprocessor(groups: ColumnGroups) -> ColumnTransformer:
 
     categorical_pipeline = Pipeline(
         steps=[
-            # Fill NaN with a dedicated category before encoding so the
-            # encoder sees a clean string-only input.
+            # Step 1: coerce all non-null values to str.
+            # Needed because engineer.py can produce object columns with mixed
+            # float + str entries that would crash OneHotEncoder's sort().
+            (
+                "to_str",
+                FunctionTransformer(_to_str_array, validate=False),
+            ),
+            # Step 2: fill remaining NaN with a dedicated category string.
             (
                 "imputer",
                 SimpleImputer(strategy="constant", fill_value="__missing__"),
             ),
+            # Step 3: one-hot encode.
             (
                 "encoder",
                 OneHotEncoder(
-                    handle_unknown="ignore",   # unknown at inference → all-zero row
+                    handle_unknown="ignore",   # unknown at inference -> all-zero row
                     sparse_output=False,       # return dense array
                     drop="if_binary",          # drop one column for binary features
                                                # to avoid perfect multicollinearity
@@ -478,8 +577,8 @@ def build_linear_preprocessor(groups: ColumnGroups) -> ColumnTransformer:
     transformers: list[tuple[str, Any, list[str]]] = []
     if groups.numeric:
         transformers.append(("numeric", numeric_pipeline, groups.numeric))
-    if groups.categorical:
-        transformers.append(("categorical", categorical_pipeline, groups.categorical))
+    if safe_categorical:
+        transformers.append(("categorical", categorical_pipeline, safe_categorical))
 
     preprocessor = ColumnTransformer(
         transformers=transformers,
@@ -490,9 +589,11 @@ def build_linear_preprocessor(groups: ColumnGroups) -> ColumnTransformer:
     logger.info(
         "Linear preprocessor built | "
         "SimpleImputer+RobustScaler on %d numeric, "
-        "SimpleImputer+OneHotEncoder on %d categorical.",
+        "to_str+SimpleImputer+OHE on %d categorical (max_ohe=%d, dropped %d high-card).",
         len(groups.numeric),
-        len(groups.categorical),
+        len(safe_categorical),
+        max_ohe_categories,
+        len(groups.categorical) - len(safe_categorical),
     )
     return preprocessor
 
@@ -557,7 +658,7 @@ def apply_preprocessor(
         index=X.index,
     )
     logger.info(
-        "Transformed %s split | input shape=%s → output shape=%s",
+        "Transformed %s split | input shape=%s -> output shape=%s",
         split_name,
         X.shape,
         result.shape,
@@ -598,7 +699,7 @@ def save_splits(splits: DataSplits, processed_dir: Path) -> None:
             data.to_frame().to_parquet(path, index=True)
         else:
             data.to_parquet(path, index=True)
-        logger.info("Saved %s → %s  (shape=%s)", name, path, data.shape)
+        logger.info("Saved %s -> %s  (shape=%s)", name, path, data.shape)
 
 
 def load_splits(processed_dir: Path) -> DataSplits:
@@ -653,7 +754,7 @@ def save_preprocessor(preprocessor: ColumnTransformer, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as handle:
         pickle.dump(preprocessor, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    logger.info("Preprocessor saved → %s", path)
+    logger.info("Preprocessor saved -> %s", path)
 
 
 def load_preprocessor(path: Path) -> ColumnTransformer:

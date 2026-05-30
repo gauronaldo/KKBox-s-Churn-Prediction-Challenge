@@ -92,10 +92,13 @@ def _ensure_datetime(frame: pd.DataFrame, column: str) -> None:
 def _reference_date(
     frame: pd.DataFrame, columns: list[str]
 ) -> pd.Timestamp | None:
-    """Compute a stable reference date from the latest observed datetime.
+    """Compute a stable reference date from the latest OBSERVED (not future) datetime.
 
-    Using the maximum observed date (rather than ``datetime.now()``) ensures
-    full reproducibility when re-running the pipeline on static snapshots.
+    ``last_expire_date`` is intentionally excluded: membership expiry can be a
+    future date for active subscribers, which would push the reference far beyond
+    the actual data collection cutoff and inflate all tenure/recency features.
+    Only columns reflecting *actual observed events* (log activity, transactions,
+    registration) should anchor the reference date.
 
     Args:
         frame: DataFrame containing the candidate datetime columns.
@@ -104,8 +107,20 @@ def _reference_date(
     Returns:
         The maximum valid timestamp found, or ``None`` if none exist.
     """
+    # Exclude forward-looking dates: expiry dates reflect future obligations,
+    # not past observations. Using them shifts the reference date into the
+    # future, breaking days_since and tenure computations.
+    EXCLUDED_FROM_REFERENCE = {"last_expire_date"}
+
     dates: list[pd.Timestamp] = []
     for column in columns:
+        if column in EXCLUDED_FROM_REFERENCE:
+            logger.debug(
+                "Skipping '%s' from reference date calculation "
+                "(forward-looking date).",
+                column,
+            )
+            continue
         if column in frame.columns and pd.api.types.is_datetime64_any_dtype(
             frame[column]
         ):
@@ -119,7 +134,7 @@ def _reference_date(
         )
         return None
     ref = max(dates)
-    logger.debug("Reference date resolved to %s.", ref)
+    logger.info("Reference date resolved to %s (excluded: %s).", ref, EXCLUDED_FROM_REFERENCE)
     return ref
 
 
@@ -305,14 +320,21 @@ def engineer_features(
             config, "feature_engineering", "log_scale_features", default=[]
         )
     )
+    # Read cutoff from config.  This MUST match the cutoff applied during
+    # ingestion (run_ingestion.py) so that all days_since_* features and
+    # member_age_days use an identical, leak-free anchor point.
+    cutoff_str: str | None = get_value(
+        config, "feature_engineering", "cutoff_date", default=None
+    )
 
     logger.info(
         "Starting feature engineering | age_min=%d, age_max=%d, "
-        "recent_window=%d days, log_features=%s",
+        "recent_window=%d days, log_features=%s, cutoff=%s",
         age_min,
         age_max,
         recent_days_window,
         log_scale_features,
+        cutoff_str,
     )
 
     # -------------------------------------------------------------------------
@@ -327,7 +349,32 @@ def engineer_features(
     for column in datetime_columns:
         _ensure_datetime(df, column)
 
-    reference_date = _reference_date(df, datetime_columns)
+    # Resolve reference_date from config (preferred) or fall back to data-driven.
+    # IMPORTANT: last_expire_date is intentionally excluded from the data-driven
+    # fallback because it is a FORWARD-LOOKING date (the membership expiry can
+    # extend into the churn observation window), which would push the anchor
+    # into the future and cause temporal leakage.
+    if cutoff_str:
+        reference_date: pd.Timestamp | None = pd.Timestamp(cutoff_str)
+        logger.info(
+            "Reference date from config cutoff_date: %s", reference_date.date()
+        )
+    else:
+        reference_date = _reference_date(
+            df,
+            [
+                "last_transaction_date",
+                "last_log_date",
+                "registration_init_time",
+                # last_expire_date deliberately excluded: forward-looking.
+            ],
+        )
+        logger.warning(
+            "feature_engineering.cutoff_date not set in config. "
+            "Falling back to data-driven reference date: %s. "
+            "Verify this does not overlap with the churn observation window.",
+            reference_date,
+        )
     if reference_date is not None:
         # Store as a scalar column so downstream code can audit the snapshot.
         df["analysis_reference_date"] = reference_date
@@ -371,7 +418,7 @@ def engineer_features(
 
     if "gender" in df.columns:
         df["gender_clean"] = _normalize_gender(df["gender"])
-        logger.debug("Normalized 'gender' → 'gender_clean'.")
+        logger.debug("Normalized 'gender' -> 'gender_clean'.")
 
     profile_columns = [
         c for c in ["bd", "gender", "city", "registered_via"] if c in df.columns
@@ -519,7 +566,7 @@ def engineer_features(
                 pd.to_numeric(df[column], errors="coerce").fillna(0)
             )
             logger.debug(
-                "Applied log1p transform: '%s' → '%s'.", column, log_col
+                "Applied log1p transform: '%s' -> '%s'.", column, log_col
             )
 
     # -------------------------------------------------------------------------

@@ -3,8 +3,12 @@
 Workflow
 --------
 1. Load preprocessed train / validation splits from ``data/processed/``.
-2. Train a Logistic Regression baseline (logged separately).
-3. Train all candidate models (LR, RF, LightGBM) under MLflow tracking.
+2. Load the raw feature frame and build a OneHot linear preprocessor for LR.
+3. Train all candidate models under MLflow tracking:
+   - Logistic Regression  (OneHot + RobustScaler)
+   - Random Forest        (OrdinalEncoded, tree-native)
+   - XGBoost              (OrdinalEncoded, scale_pos_weight)
+   - LightGBM             (OrdinalEncoded, scale_pos_weight)
 4. Select the champion by highest validation AUC-PR.
 5. Persist the champion model and a full comparison table.
 
@@ -12,23 +16,23 @@ Design decisions
 ----------------
 * Hold-out validation (not cross-validation): ~1M users gives stable
   metric estimates on a fixed val split without the 5× compute of CV.
-* Class imbalance: ``class_weight='balanced'`` for sklearn models;
-  ``scale_pos_weight`` for LightGBM. No SMOTE — tree models handle
-  imbalance natively and synthetic samples can introduce artefacts on
-  tabular data.
+* Class imbalance:
+  - ``class_weight='balanced'`` for sklearn models (LR, RF).
+  - ``scale_pos_weight = n_neg / n_pos`` for XGBoost and LightGBM.
 * Champion metric: AUC-PR is preferred over AUC-ROC for imbalanced
   churn data because it is more sensitive to minority-class performance.
-* LightGBM uses callback-based early stopping on the validation set to
-  prevent overfitting and reduce wall-clock training time.
-* Every run is logged to MLflow (parameters, metrics, model artifact)
-  for full experiment reproducibility.
+* LR uses a separate OneHot+RobustScaler preprocessor built from the raw
+  feature frame; tree models use the OrdinalEncoded splits from preprocessing.
+* XGBoost and LightGBM use early stopping on validation average_precision
+  to prevent overfitting and avoid manual ``n_estimators`` tuning.
+* Every run is logged to MLflow for full experiment reproducibility.
 """
 
 from __future__ import annotations
 
 import logging
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -38,6 +42,7 @@ import mlflow.lightgbm
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -48,6 +53,12 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+from src.features.preprocess import (
+    _sanitise_for_sklearn,
+    build_linear_preprocessor,
+    identify_column_groups,
+    split_dataset,
+)
 from src.utils.config import get_value
 
 logger = logging.getLogger(__name__)
@@ -57,6 +68,7 @@ __all__ = [
     "ModelResult",
     "train_logistic_regression",
     "train_random_forest",
+    "train_xgboost",
     "train_lightgbm",
     "select_champion",
     "save_model",
@@ -82,8 +94,7 @@ class MetricsBundle:
         precision: Precision at the configured decision threshold.
         recall: Recall at the configured decision threshold.
         lift_at_top10: Churn lift in the top-decile of predicted scores
-                       versus random targeting. A lift of 3.0 means the
-                       model finds 3× more churners than random selection.
+                       versus random targeting.
     """
 
     auc_roc: float
@@ -117,13 +128,13 @@ class ModelResult:
     """Container for a trained model and its evaluation outputs.
 
     Attributes:
-        name: Human-readable model identifier (e.g. ``"lightgbm"``).
+        name: Human-readable model identifier (e.g. ``"xgboost"``).
         model: The fitted scikit-learn-compatible estimator.
         params: Hyper-parameters passed to the model constructor.
         train_metrics: MetricsBundle evaluated on the training split.
         val_metrics: MetricsBundle evaluated on the validation split.
         mlflow_run_id: MLflow run ID, or ``None`` if tracking is disabled.
-        best_iteration: LightGBM best iteration (0 for other models).
+        best_iteration: Best early-stopping iteration (0 for other models).
     """
 
     name: str
@@ -136,20 +147,18 @@ class ModelResult:
 
 
 # ---------------------------------------------------------------------------
-# Metric helpers
+# Private helpers
 # ---------------------------------------------------------------------------
 
 
 def _lift_at_top_k(
-    y_true: pd.Series,
+    y_true: pd.Series | np.ndarray,
     y_score: np.ndarray,
     k: float = 0.10,
 ) -> float:
     """Compute churn lift in the top-k fraction of predicted scores.
 
     Lift = precision_in_top_k / baseline_churn_rate.
-    A lift of 3.0 means targeting the top-10% of predictions finds 3×
-    more churners than selecting 10% of users at random.
 
     Args:
         y_true: True binary labels.
@@ -161,15 +170,15 @@ def _lift_at_top_k(
     """
     n_top = max(1, int(len(y_true) * k))
     top_indices = np.argsort(y_score)[::-1][:n_top]
-    precision_top_k = float(np.array(y_true)[top_indices].mean())
-    baseline = float(y_true.mean())
+    precision_top_k = float(np.asarray(y_true)[top_indices].mean())
+    baseline = float(np.asarray(y_true).mean())
     if baseline == 0.0:
         return 0.0
     return precision_top_k / baseline
 
 
 def _compute_metrics(
-    y_true: pd.Series,
+    y_true: pd.Series | np.ndarray,
     y_score: np.ndarray,
     threshold: float = 0.5,
 ) -> MetricsBundle:
@@ -194,12 +203,8 @@ def _compute_metrics(
     )
 
 
-def _scale_pos_weight(y_train: pd.Series) -> float:
-    """Compute LightGBM scale_pos_weight from training labels.
-
-    ``scale_pos_weight = n_negative / n_positive`` tells LightGBM to
-    up-weight the minority (churn) class, equivalent to class_weight
-    in sklearn. This is the recommended approach for binary imbalance in LGB.
+def _scale_pos_weight(y_train: pd.Series | np.ndarray) -> float:
+    """Compute scale_pos_weight from training labels (n_neg / n_pos).
 
     Args:
         y_train: Training target labels.
@@ -207,16 +212,23 @@ def _scale_pos_weight(y_train: pd.Series) -> float:
     Returns:
         Float ratio of negative to positive samples.
     """
-    n_pos = int((y_train == 1).sum())
-    n_neg = int((y_train == 0).sum())
+    arr = np.asarray(y_train)
+    n_pos = int((arr == 1).sum())
+    n_neg = int((arr == 0).sum())
     if n_pos == 0:
         raise ValueError("Training labels contain no positive (churn) samples.")
     ratio = n_neg / n_pos
     logger.info(
-        "Class counts | neg=%d, pos=%d → scale_pos_weight=%.2f",
+        "Class counts | neg=%d, pos=%d -> scale_pos_weight=%.2f",
         n_neg, n_pos, ratio,
     )
     return ratio
+
+
+# _sanitise_for_sklearn is imported from src.features.preprocess.
+# It handles StringDtype, BooleanDtype, CategoricalDtype, and object columns
+# that contain pd.NA or mixed float+str values — all cases that cause
+# sklearn encoders to crash.
 
 
 # ---------------------------------------------------------------------------
@@ -230,10 +242,6 @@ def _log_to_mlflow(
     tracking_uri: str | None,
 ) -> str | None:
     """Log a ModelResult to MLflow and return the run ID.
-
-    Logs parameters, train + val metrics, and the serialised model artifact.
-    If MLflow is not available or the tracking URI is invalid, the error is
-    caught and ``None`` is returned so training continues uninterrupted.
 
     Args:
         result: Populated ModelResult to log.
@@ -250,16 +258,12 @@ def _log_to_mlflow(
 
         with mlflow.start_run(run_name=result.name) as run:
             mlflow.log_params(result.params)
-
-            # Log train and val metrics under prefixed keys.
             mlflow.log_metrics(result.train_metrics.to_dict(prefix="train_"))
             mlflow.log_metrics(result.val_metrics.to_dict(prefix="val_"))
 
             if result.best_iteration > 0:
                 mlflow.log_param("best_iteration", result.best_iteration)
 
-            # Use the native LightGBM flavour when available for richer
-            # signature inference; fall back to sklearn for other models.
             if isinstance(result.model, lgb.LGBMClassifier):
                 mlflow.lightgbm.log_model(result.model, artifact_path="model")
             else:
@@ -275,8 +279,7 @@ def _log_to_mlflow(
         logger.warning(
             "MLflow logging failed for '%s': %s. "
             "Training will continue without tracking.",
-            result.name,
-            exc,
+            result.name, exc,
         )
         return None
 
@@ -287,23 +290,24 @@ def _log_to_mlflow(
 
 
 def train_logistic_regression(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
+    X_train: np.ndarray | pd.DataFrame,
+    y_train: pd.Series | np.ndarray,
+    X_val: np.ndarray | pd.DataFrame,
+    y_val: pd.Series | np.ndarray,
     config: Mapping[str, Any],
     threshold: float = 0.5,
 ) -> ModelResult:
     """Train a Logistic Regression model.
 
-    Used both as the interpretable baseline and as a candidate for comparison.
-    ``class_weight='balanced'`` compensates for the churn minority class by
-    inversely weighting samples proportional to class frequency.
+    Expects OneHot-encoded and RobustScaled input (built via
+    ``build_linear_preprocessor`` in ``run_training``).  Using raw
+    OrdinalEncoded features would impose a false numeric ordering on
+    categorical columns, causing the coefficients to learn garbage signals.
 
     Args:
-        X_train: Training feature matrix.
+        X_train: Training feature matrix (OneHot + RobustScaled).
         y_train: Training labels.
-        X_val: Validation feature matrix.
+        X_val: Validation feature matrix (same preprocessing).
         y_val: Validation labels.
         config: Parsed project configuration.
         threshold: Decision threshold for binary classification metrics.
@@ -315,11 +319,10 @@ def train_logistic_regression(
         get_value(config, "project", "random_state", default=42)
     )
     params: dict[str, Any] = {
-        "solver":       get_value(config, "logistic_regression", "solver", default="lbfgs"),
+        "solver":       str(get_value(config, "logistic_regression", "solver", default="lbfgs")),
         "max_iter":     int(get_value(config, "logistic_regression", "max_iter", default=1000)),
         "class_weight": get_value(config, "logistic_regression", "class_weight", default="balanced"),
         "random_state": random_state,
-        "n_jobs":       -1,
     }
     logger.info("Training Logistic Regression | params=%s", params)
 
@@ -358,12 +361,11 @@ def train_random_forest(
 ) -> ModelResult:
     """Train a Random Forest classifier.
 
-    Random Forest is included as a strong non-linear baseline. It provides
-    reliable feature importance estimates via mean decrease in impurity,
-    which can guide feature selection before Optuna tuning.
+    Random Forest is included as a strong non-linear baseline and provides
+    reliable feature importance estimates via mean decrease in impurity.
 
     Args:
-        X_train: Training feature matrix.
+        X_train: Training feature matrix (OrdinalEncoded).
         y_train: Training labels.
         X_val: Validation feature matrix.
         y_val: Validation labels.
@@ -377,13 +379,13 @@ def train_random_forest(
         get_value(config, "project", "random_state", default=42)
     )
     params: dict[str, Any] = {
-        "n_estimators":   int(get_value(config, "random_forest", "n_estimators", default=300)),
-        "max_depth":      get_value(config, "random_forest", "max_depth", default=None),
+        "n_estimators":      int(get_value(config, "random_forest", "n_estimators", default=300)),
+        "max_depth":         get_value(config, "random_forest", "max_depth", default=None),
         "min_samples_split": int(get_value(config, "random_forest", "min_samples_split", default=2)),
         "min_samples_leaf":  int(get_value(config, "random_forest", "min_samples_leaf", default=1)),
-        "class_weight":   get_value(config, "random_forest", "class_weight", default="balanced"),
-        "n_jobs":         int(get_value(config, "random_forest", "n_jobs", default=-1)),
-        "random_state":   random_state,
+        "class_weight":      get_value(config, "random_forest", "class_weight", default="balanced"),
+        "n_jobs":            int(get_value(config, "random_forest", "n_jobs", default=-1)),
+        "random_state":      random_state,
     }
     logger.info("Training Random Forest | params=%s", params)
 
@@ -412,6 +414,91 @@ def train_random_forest(
     )
 
 
+def train_xgboost(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    config: Mapping[str, Any],
+    threshold: float = 0.5,
+) -> ModelResult:
+    """Train an XGBoost gradient boosting model with early stopping.
+
+    Early stopping monitors ``aucpr`` (AUC-PR) on the validation set and
+    halts when no improvement is seen for ``early_stopping_rounds`` rounds.
+    ``scale_pos_weight`` compensates for the class imbalance.
+
+    Args:
+        X_train: Training feature matrix (OrdinalEncoded).
+        y_train: Training labels.
+        X_val: Validation feature matrix.
+        y_val: Validation labels.
+        config: Parsed project configuration.
+        threshold: Decision threshold for binary classification metrics.
+
+    Returns:
+        Populated ``ModelResult`` with ``best_iteration`` set.
+    """
+    random_state: int = int(
+        get_value(config, "project", "random_state", default=42)
+    )
+    early_stopping_rounds: int = int(
+        get_value(config, "xgboost", "early_stopping_rounds", default=50)
+    )
+    log_eval_period: int = int(
+        get_value(config, "xgboost", "log_eval_period", default=100)
+    )
+
+    params: dict[str, Any] = {
+        "n_estimators":         int(get_value(config, "xgboost", "n_estimators", default=1000)),
+        "learning_rate":        float(get_value(config, "xgboost", "learning_rate", default=0.05)),
+        "max_depth":            int(get_value(config, "xgboost", "max_depth", default=6)),
+        "subsample":            float(get_value(config, "xgboost", "subsample", default=0.8)),
+        "colsample_bytree":     float(get_value(config, "xgboost", "colsample_bytree", default=0.8)),
+        "tree_method":          str(get_value(config, "xgboost", "tree_method", default="hist")),
+        "eval_metric":          str(get_value(config, "xgboost", "eval_metric", default="aucpr")),
+        "early_stopping_rounds": early_stopping_rounds,
+        "scale_pos_weight":     _scale_pos_weight(y_train),
+        "random_state":         random_state,
+        "n_jobs":               -1,
+        "verbosity":            0,
+    }
+    logger.info("Training XGBoost | params=%s", params)
+
+    model = xgb.XGBClassifier(**params)
+    model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=log_eval_period,
+    )
+
+    best_iter = int(model.best_iteration) if hasattr(model, "best_iteration") else params["n_estimators"]
+
+    train_score = model.predict_proba(X_train)[:, 1]
+    val_score   = model.predict_proba(X_val)[:, 1]
+
+    train_metrics = _compute_metrics(y_train, train_score, threshold)
+    val_metrics   = _compute_metrics(y_val,   val_score,   threshold)
+
+    logger.info(
+        "XGBoost | best_iter=%d  val_auc_roc=%.4f  val_auc_pr=%.4f  "
+        "val_f1=%.4f  lift@10%%=%.2f",
+        best_iter,
+        val_metrics.auc_roc, val_metrics.auc_pr,
+        val_metrics.f1,      val_metrics.lift_at_top10,
+    )
+
+    return ModelResult(
+        name="xgboost",
+        model=model,
+        params=params,
+        train_metrics=train_metrics,
+        val_metrics=val_metrics,
+        best_iteration=best_iter,
+    )
+
+
 def train_lightgbm(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -422,17 +509,12 @@ def train_lightgbm(
 ) -> ModelResult:
     """Train a LightGBM gradient boosting model with early stopping.
 
-    Early stopping monitors val AUC every round and halts training when
-    no improvement is observed for ``early_stopping_rounds`` consecutive
-    rounds. This prevents overfitting and avoids the need to manually
-    tune ``n_estimators`` — the best iteration is recorded in the result.
-
-    ``scale_pos_weight`` is computed from the training label distribution
-    to up-weight the minority churn class, equivalent to class_weight in
-    sklearn but natively supported by LightGBM's loss function.
+    Early stopping monitors ``average_precision`` (AUC-PR) on the validation
+    set, consistent with the project's champion metric.  ``scale_pos_weight``
+    compensates for the churn minority class.
 
     Args:
-        X_train: Training feature matrix.
+        X_train: Training feature matrix (OrdinalEncoded).
         y_train: Training labels.
         X_val: Validation feature matrix.
         y_val: Validation labels.
@@ -449,20 +531,31 @@ def train_lightgbm(
         get_value(config, "lightgbm", "early_stopping_rounds", default=100)
     )
     log_eval_period: int = int(
-        get_value(config, "lightgbm", "log_eval_period", default=50)
+        get_value(config, "lightgbm", "log_eval_period", default=100)
+    )
+    metric: str = str(
+        get_value(config, "lightgbm", "metric", default="aucpr")
     )
 
     params: dict[str, Any] = {
-        "n_estimators":    int(get_value(config, "lightgbm", "n_estimators", default=500)),
-        "learning_rate":   float(get_value(config, "lightgbm", "learning_rate", default=0.05)),
-        "num_leaves":      int(get_value(config, "lightgbm", "num_leaves", default=31)),
-        "max_depth":       int(get_value(config, "lightgbm", "max_depth", default=-1)),
-        "subsample":       float(get_value(config, "lightgbm", "subsample", default=0.8)),
-        "colsample_bytree":float(get_value(config, "lightgbm", "colsample_bytree", default=0.8)),
-        "scale_pos_weight":_scale_pos_weight(y_train),
-        "random_state":    random_state,
-        "n_jobs":          -1,
-        "verbose":         -1,       # suppress LGB stdout — logging handles output
+        "n_estimators":     int(get_value(config, "lightgbm", "n_estimators", default=1000)),
+        "learning_rate":    float(get_value(config, "lightgbm", "learning_rate", default=0.05)),
+        "num_leaves":       int(get_value(config, "lightgbm", "num_leaves", default=31)),
+        "max_depth":        int(get_value(config, "lightgbm", "max_depth", default=-1)),
+        "min_child_samples":int(get_value(config, "lightgbm", "min_child_samples", default=50)),
+        "reg_alpha":        float(get_value(config, "lightgbm", "reg_alpha", default=0.1)),
+        "reg_lambda":       float(get_value(config, "lightgbm", "reg_lambda", default=1.0)),
+        "subsample":        float(get_value(config, "lightgbm", "subsample", default=0.8)),
+        "colsample_bytree": float(get_value(config, "lightgbm", "colsample_bytree", default=0.8)),
+        "scale_pos_weight": _scale_pos_weight(y_train),
+        # Setting metric in the constructor ensures early_stopping callback
+        # monitors ONLY this metric (not binary_logloss which is the default).
+        # "auc" is stable, well-calibrated, and "higher = better" — the callback
+        # correctly infers the maximisation direction.
+        "metric":           metric,
+        "random_state":     random_state,
+        "n_jobs":           -1,
+        "verbose":          -1,
     }
     logger.info("Training LightGBM | params=%s", params)
 
@@ -471,11 +564,14 @@ def train_lightgbm(
         X_train,
         y_train,
         eval_set=[(X_val, y_val)],
-        eval_metric="auc",
+        # eval_metric is intentionally omitted here — the metric is already set
+        # in the constructor via params["metric"].  Passing it again in fit()
+        # would add a SECOND metric (causing early_stopping to monitor both
+        # binary_logloss and our metric, and stop on whichever degrades first).
         callbacks=[
             lgb.early_stopping(
                 stopping_rounds=early_stopping_rounds,
-                verbose=False,    # suppress callback stdout
+                verbose=False,
             ),
             lgb.log_evaluation(period=log_eval_period),
         ],
@@ -521,7 +617,6 @@ def select_champion(
     Args:
         results: List of trained ModelResults to compare.
         champion_metric: Attribute name on ``MetricsBundle`` to rank by.
-                         Defaults to ``"auc_pr"`` (from config).
 
     Returns:
         The ``ModelResult`` with the highest validation metric.
@@ -550,8 +645,6 @@ def select_champion(
         champion_metric,
         getattr(champion.val_metrics, champion_metric),
     )
-
-    # Log the full comparison for transparency.
     for result in sorted(
         results,
         key=lambda r: getattr(r.val_metrics, champion_metric),
@@ -582,7 +675,7 @@ def save_model(model: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as handle:
         pickle.dump(model, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    logger.info("Model saved → %s", path)
+    logger.info("Model saved -> %s", path)
 
 
 def load_model(path: Path) -> Any:
@@ -635,7 +728,7 @@ def save_comparison_table(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     comparison.to_csv(path, index=False)
-    logger.info("Model comparison table saved → %s", path)
+    logger.info("Model comparison table saved -> %s", path)
     logger.info("\n%s", comparison.to_string(index=False))
 
     return comparison
@@ -654,12 +747,16 @@ def run_training(
 
     Steps
     -----
-    1. Load preprocessed splits from ``data/processed/``.
-    2. Train baseline Logistic Regression (logged separately in MLflow).
-    3. Train all candidate models under MLflow experiment tracking.
-    4. Select the champion by ``config.modeling.champion_metric``.
-    5. Save the champion model and a comparison CSV to ``models/`` and
-       ``reports/`` respectively.
+    1. Load OrdinalEncoded splits (X_train / X_val) from ``data/processed/``.
+    2. If Logistic Regression is a candidate, load the raw feature frame and
+       fit a OneHot+RobustScaler linear preprocessor to produce X_train_lr /
+       X_val_lr.  This avoids the false ordinal ordering that OrdinalEncoded
+       features impose on linear models.
+    3. Train all candidate models, dispatching linear models to OneHot data
+       and tree models to OrdinalEncoded data.
+    4. Select the champion by ``config.modeling.champion_metric`` (AUC-PR).
+    5. Save each model individually and the champion separately; write a
+       comparison CSV to ``reports/``.
 
     Args:
         config: Parsed project configuration (from ``config.yaml``).
@@ -671,9 +768,9 @@ def run_training(
     Raises:
         FileNotFoundError: If the preprocessed split files are absent.
     """
-    processed_dir  = project_root / "data" / "processed"
-    models_dir     = project_root / "models"
-    reports_dir    = project_root / "reports"
+    processed_dir = project_root / "data" / "processed"
+    models_dir    = project_root / "models"
+    reports_dir   = project_root / "reports"
 
     threshold: float = float(
         get_value(config, "modeling", "decision_threshold", default=0.5)
@@ -695,7 +792,7 @@ def run_training(
     )
 
     # -------------------------------------------------------------------------
-    # 1. Load preprocessed splits
+    # 1. Load OrdinalEncoded splits (for tree models)
     # -------------------------------------------------------------------------
     logger.info("Loading preprocessed splits from %s ...", processed_dir)
 
@@ -704,7 +801,7 @@ def run_training(
         if not path.exists():
             raise FileNotFoundError(
                 f"Split file not found: {path}. "
-                "Run the preprocessing stage first."
+                "Run 'python src/features/run_preprocessing.py' first."
             )
         df = pd.read_parquet(path)
         if name.startswith("y_"):
@@ -724,53 +821,138 @@ def run_training(
     )
 
     # -------------------------------------------------------------------------
-    # 2. Trainer dispatch map
+    # 2. Build OneHot linear preprocessor for Logistic Regression
     # -------------------------------------------------------------------------
+    # Tree models (RF, XGB, LGB) use the OrdinalEncoded splits above.
+    # LR needs OneHotEncoded + RobustScaled data built from the raw feature
+    # frame, because OrdinalEncoded integers impose a false ordering on
+    # categorical features that confounds linear coefficients.
+    X_train_lr: np.ndarray | None = None
+    X_val_lr:   np.ndarray | None = None
+    y_train_lr: pd.Series  | None = None
+    y_val_lr:   pd.Series  | None = None
+
+    if "logistic_regression" in candidates:
+        output_file = str(
+            get_value(config, "feature_engineering", "output_file",
+                      default="feature_frame.parquet")
+        )
+        ff_path = processed_dir / output_file
+        if not ff_path.exists():
+            raise FileNotFoundError(
+                f"Feature frame not found: {ff_path}. "
+                "Run 'python src/features/run_engineer.py' first."
+            )
+
+        logger.info("Loading feature frame for linear preprocessor: %s", ff_path)
+        ff = pd.read_parquet(ff_path)
+        target_col: str = str(
+            get_value(config, "project", "target_col", default="is_churn")
+        )
+
+        # Reproduce the SAME train/val split used by run_preprocessing.py.
+        # split_dataset uses the same random_state and sizes from config,
+        # so train_ff rows are identical to those in X_train / y_train.
+        train_ff, val_ff, _ = split_dataset(ff, config)
+
+        # Columns to exclude from the linear feature matrix.
+        _LINEAR_DROP: set[str] = {
+            target_col, "msno", "analysis_reference_date",
+            "registration_init_time", "last_transaction_date",
+            "last_expire_date", "last_log_date",
+            # Raw demographic columns superseded by derived features:
+            "bd", "gender", "city", "registered_via",
+        }
+        feat_cols = [c for c in ff.columns if c not in _LINEAR_DROP]
+
+        groups_lr = identify_column_groups(
+            train_ff[feat_cols], extra_drop=list(_LINEAR_DROP)
+        )
+        # Pass X_ref so high-cardinality object columns (numeric features
+        # accidentally stored as object dtype) are excluded from OHE.
+        # Without this guard, OHE can produce millions of columns and OOM.
+        lr_preprocessor = build_linear_preprocessor(
+            groups_lr,
+            X_ref=train_ff[feat_cols],
+            max_ohe_categories=50,
+        )
+
+        # Sanitise pandas extension dtypes before sklearn sees the data.
+        train_lr_clean = _sanitise_for_sklearn(train_ff[feat_cols])
+        val_lr_clean   = _sanitise_for_sklearn(val_ff[feat_cols])
+
+        logger.info(
+            "Fitting linear preprocessor | numeric=%d, categorical=%d",
+            len(groups_lr.numeric), len(groups_lr.categorical),
+        )
+        X_train_lr = lr_preprocessor.fit_transform(train_lr_clean)
+        X_val_lr   = lr_preprocessor.transform(val_lr_clean)
+        y_train_lr = pd.Series(train_ff[target_col].values, name="is_churn")
+        y_val_lr   = pd.Series(val_ff[target_col].values,   name="is_churn")
+
+        logger.info(
+            "Linear preprocessor fitted | X_train_lr=%s", X_train_lr.shape
+        )
+
+    # -------------------------------------------------------------------------
+    # 3. Train all candidate models
+    # -------------------------------------------------------------------------
+    # Linear models receive OneHot-preprocessed data; tree models receive
+    # the OrdinalEncoded splits from data/processed/.
+    _LINEAR_MODELS: set[str] = {"logistic_regression"}
+
     trainer_map: dict[str, Any] = {
         "logistic_regression": train_logistic_regression,
         "random_forest":       train_random_forest,
+        "xgboost":             train_xgboost,
         "lightgbm":            train_lightgbm,
     }
 
-    # -------------------------------------------------------------------------
-    # 3. Train baseline (always, regardless of candidate list)
-    # -------------------------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("STAGE: Baseline — Logistic Regression")
-    logger.info("=" * 60)
-
-    baseline_result = train_logistic_regression(
-        X_train, y_train, X_val, y_val, config, threshold
-    )
-    baseline_result.mlflow_run_id = _log_to_mlflow(
-        baseline_result, f"{experiment_name}/baseline", tracking_uri
-    )
-
-    # -------------------------------------------------------------------------
-    # 4. Train all candidate models
-    # -------------------------------------------------------------------------
     all_results: list[ModelResult] = []
 
     for model_name in candidates:
-        logger.info("=" * 60)
-        logger.info("STAGE: Candidate — %s", model_name)
-        logger.info("=" * 60)
-
         if model_name not in trainer_map:
             logger.warning(
                 "Unknown candidate model '%s' in config — skipping.", model_name
             )
             continue
 
+        logger.info("=" * 60)
+        logger.info("STAGE: %s", model_name)
+        logger.info("=" * 60)
+
         trainer_fn = trainer_map[model_name]
-        result = trainer_fn(X_train, y_train, X_val, y_val, config, threshold)
-        result.mlflow_run_id = _log_to_mlflow(
-            result, experiment_name, tracking_uri
-        )
+
+        if model_name in _LINEAR_MODELS:
+            if X_train_lr is None:
+                logger.warning(
+                    "Linear preprocessed data not available for '%s' — skipping.",
+                    model_name,
+                )
+                continue
+            result = trainer_fn(
+                X_train_lr, y_train_lr,
+                X_val_lr,   y_val_lr,
+                config, threshold,
+            )
+        else:
+            result = trainer_fn(
+                X_train, y_train,
+                X_val,   y_val,
+                config, threshold,
+            )
+
+        result.mlflow_run_id = _log_to_mlflow(result, experiment_name, tracking_uri)
         all_results.append(result)
 
+    if not all_results:
+        raise ValueError(
+            "No models were trained. "
+            "Check 'candidate_models' in config.yaml."
+        )
+
     # -------------------------------------------------------------------------
-    # 5. Champion selection
+    # 4. Champion selection
     # -------------------------------------------------------------------------
     logger.info("=" * 60)
     logger.info("STAGE: Champion Selection  (metric: val_%s)", champion_metric)
@@ -779,11 +961,10 @@ def run_training(
     champion = select_champion(all_results, champion_metric)
 
     # -------------------------------------------------------------------------
-    # 6. Persist champion and comparison table
+    # 5. Persist champion, individual models, and comparison table
     # -------------------------------------------------------------------------
     save_model(champion.model, models_dir / "champion_model.pkl")
 
-    # Also save each candidate individually for post-hoc analysis.
     for result in all_results:
         save_model(result.model, models_dir / f"{result.name}.pkl")
 
@@ -792,14 +973,13 @@ def run_training(
         reports_dir / "model_comparison.csv",
     )
 
-    # Write the champion name to a plain-text file so downstream
-    # stages (Optuna tuner, evaluator) can discover it without parsing CSV.
+    # Write the champion name so downstream stages (tuner, evaluator) can
+    # discover it without parsing the CSV.
     champion_name_path = models_dir / "champion_name.txt"
     champion_name_path.write_text(champion.name, encoding="utf-8")
     logger.info(
-        "Champion name written → %s  (%s)",
-        champion_name_path,
-        champion.name,
+        "Champion name written -> %s  (%s)",
+        champion_name_path, champion.name,
     )
 
     logger.info("=" * 60)
