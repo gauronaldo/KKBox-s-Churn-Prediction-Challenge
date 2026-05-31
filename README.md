@@ -9,7 +9,7 @@
 ![Pytest](https://img.shields.io/badge/testing-pytest-blue.svg)
 ![Ruff](https://img.shields.io/badge/linting-ruff-000000.svg)
 
-Leak-safe churn prediction pipeline for the WSDM 2018 KKBox challenge.
+Churn prediction pipeline for the WSDM 2018 KKBox challenge.
 
 This repository is organized as a reproducible machine learning project. Raw data ingestion, feature engineering, preprocessing, model training, evaluation, and interpretation are all driven by code and persisted artifacts instead of notebook state.
 
