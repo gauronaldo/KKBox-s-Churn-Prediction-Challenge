@@ -93,20 +93,18 @@ modeling:
 # class_weight (logistic_regression, random_forest) uses sklearn class weights.
 
 logistic_regression:
-  # saga is the recommended solver for large datasets (n=695K).
-  # lbfgs converges in 8 iterations to a near-zero saddle point because the
-  # regularization gradient dominates the data gradient, collapsing all
-  # predict_proba to ~0.5 (default C=1.0 is too strong, C was not configurable).
-  solver: saga
-  # L1 penalty produces sparse solutions, zeroing out non-informative features.
-  # saga is the only sklearn solver that supports L1 on dense input matrices.
-  penalty: l1
-  # C=1.0 (sklearn default) is too strong for n=695K: the penalty swamps the
-  # data gradient and shrinks all coefficients to ~0 in just 8 iterations.
-  # C=10 gives 10x weaker regularisation, allowing coefficients to grow.
-  C: 10.0
-  max_iter: 2000
-  tol: 1.0e-3           # slightly looser than default 1e-4 for large datasets
+  # lbfgs: sufficient for 56 features, stable quasi-Newton convergence.
+  solver: lbfgs
+  # L2 penalty: never zeros out coefficients (unlike L1), every feature
+  # contributes a small amount. L1+class_weight='balanced' caused a sparse
+  # solution where only the intercept was active, collapsing all predict_proba
+  # to ~0.5 and giving an inverted AUC-ROC of 0.43.
+  penalty: l2
+  # C=0.1: moderate regularisation (10x stronger than default C=1.0).
+  # Stronger regularisation stabilises the solution when features are correlated
+  # and produces correct coefficient directions with class_weight='balanced'.
+  C: 0.1
+  max_iter: 1000
   class_weight: balanced
 
 xgboost:
