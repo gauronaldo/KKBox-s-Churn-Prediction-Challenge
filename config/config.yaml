@@ -67,7 +67,7 @@ feature_engineering:
   recent_days_window: 30
   # Cutoff date: ALL transactions and logs AFTER this date are excluded.
   # Must be BEFORE the churn observation window begins.
-  # KKBox cohort: memberships expire Feb-Mar 2017 → cutoff = Jan 31, 2017.
+  # KKBox cohort: memberships expire Feb-Mar 2017 -> cutoff = Jan 31, 2017.
   # Using data from the observation window (Feb-Mar 2017) leaks the churn
   # label because non-churners create renewal transactions in that period.
   cutoff_date: "2017-01-31"
@@ -88,14 +88,26 @@ modeling:
   champion_metric: auc_pr
   decision_threshold: 0.5
 
-# ── Model hyperparameters ───────────────────────────────────────────────────
+# ── Model hyperparameters ────────────────────────────────────────────────────
 # scale_pos_weight (xgboost, lightgbm) is computed dynamically as n_neg/n_pos.
-# class_weight (logistic_regression, random_forest) is set to "balanced".
+# class_weight (logistic_regression, random_forest) uses sklearn class weights.
 
 logistic_regression:
-  solver: lbfgs
-  max_iter: 1000
-  class_weight: balanced    # sklearn handles imbalance via class weights
+  # saga is the recommended solver for large datasets (n=695K).
+  # lbfgs converges in 8 iterations to a near-zero saddle point because the
+  # regularization gradient dominates the data gradient, collapsing all
+  # predict_proba to ~0.5 (default C=1.0 is too strong, C was not configurable).
+  solver: saga
+  # L1 penalty produces sparse solutions, zeroing out non-informative features.
+  # saga is the only sklearn solver that supports L1 on dense input matrices.
+  penalty: l1
+  # C=1.0 (sklearn default) is too strong for n=695K: the penalty swamps the
+  # data gradient and shrinks all coefficients to ~0 in just 8 iterations.
+  # C=10 gives 10x weaker regularisation, allowing coefficients to grow.
+  C: 10.0
+  max_iter: 2000
+  tol: 1.0e-3           # slightly looser than default 1e-4 for large datasets
+  class_weight: balanced
 
 xgboost:
   n_estimators: 1000
@@ -109,14 +121,14 @@ xgboost:
   log_eval_period: 100
 
 lightgbm:
-  metric: auc                 # early stopping monitors AUC-ROC (stable, higher=better)
+  metric: auc           # early stopping monitors AUC-ROC (stable, higher=better)
   n_estimators: 1000
   learning_rate: 0.03
   num_leaves: 31
   max_depth: -1
-  min_child_samples: 50       # regularisation: min samples per leaf
-  reg_alpha: 0.1              # L1 regularisation
-  reg_lambda: 1.0             # L2 regularisation
+  min_child_samples: 50     # regularisation: min samples per leaf
+  reg_alpha: 0.1            # L1 regularisation
+  reg_lambda: 1.0           # L2 regularisation
   subsample: 0.8
   colsample_bytree: 0.8
   early_stopping_rounds: 100
@@ -124,11 +136,15 @@ lightgbm:
 
 random_forest:
   n_estimators: 300
-  max_depth: 20
+  # max_depth 20->15: train/val AUC-PR gap was 0.22 (OVERFIT)
+  max_depth: 15
   min_samples_split: 2
-  min_samples_leaf: 10
+  # min_samples_leaf 10->30: stronger leaf regularisation
+  min_samples_leaf: 30
   n_jobs: -1
-  class_weight: balanced
+  # balanced_subsample: re-computes class weights per bootstrap sample.
+  # Better than 'balanced' (global weights) for RF ensemble methods.
+  class_weight: balanced_subsample
 
 optuna:
   n_trials: 50

@@ -319,9 +319,12 @@ def train_logistic_regression(
         get_value(config, "project", "random_state", default=42)
     )
     params: dict[str, Any] = {
-        "solver":       str(get_value(config, "logistic_regression", "solver", default="lbfgs")),
-        "max_iter":     int(get_value(config, "logistic_regression", "max_iter", default=1000)),
-        "class_weight": get_value(config, "logistic_regression", "class_weight", default="balanced"),
+        "solver":       str(get_value(config, "logistic_regression", "solver",       default="saga")),
+        "penalty":      str(get_value(config, "logistic_regression", "penalty",      default="l1")),
+        "C":            float(get_value(config, "logistic_regression", "C",          default=10.0)),
+        "max_iter":     int(get_value(config, "logistic_regression", "max_iter",     default=2000)),
+        "tol":          float(get_value(config, "logistic_regression", "tol",        default=1e-3)),
+        "class_weight": get_value(config, "logistic_regression", "class_weight",     default="balanced"),
         "random_state": random_state,
     }
     logger.info("Training Logistic Regression | params=%s", params)
