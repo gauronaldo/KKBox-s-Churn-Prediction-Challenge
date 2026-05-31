@@ -5,27 +5,59 @@
 ![XGBoost](https://img.shields.io/badge/XGBoost-3.2.0-brightgreen.svg)
 ![LightGBM](https://img.shields.io/badge/LightGBM-4.6.0-green.svg)
 ![Optuna](https://img.shields.io/badge/Optuna-4.9.0-purple.svg)
+![SHAP](https://img.shields.io/badge/SHAP-0.42.1-red.svg)
 ![MLflow](https://img.shields.io/badge/MLflow-3.12.0-blueviolet.svg)
+![GitHub Actions](https://img.shields.io/github/actions/workflow/status/gauronaldo/KKBox-s-Churn-Prediction-Challenge/ci.yml?branch=feature_engineer)
+![Jupyter](https://img.shields.io/badge/Jupyter-Notebook-F37626.svg)
 ![Pytest](https://img.shields.io/badge/testing-pytest-blue.svg)
 ![Ruff](https://img.shields.io/badge/linting-ruff-000000.svg)
 
 Leak-safe churn prediction pipeline for the WSDM 2018 KKBox challenge.
 
-This repository is organized as a reproducible machine learning project. Raw data ingestion, feature engineering, preprocessing, model training, evaluation, and interpretation are all driven by code and persisted artifacts instead of notebook state.
+This repository is organized like a portfolio-grade machine learning project: raw data ingestion, feature engineering, preprocessing, model training, evaluation, and interpretation are all driven by code and persisted artifacts instead of notebook state.
+
+## Challenge Context
+
+KKBox is a large music streaming platform in Taiwan, and the WSDM 2018 competition asks participants to predict whether a subscriber will churn after membership expiry. The problem is highly imbalanced and leakage-prone, so the project focuses on time-safe feature engineering, ranking metrics, and clean offline evaluation.
+
+## Project Snapshot
+
+| Item | Details |
+|---|---|
+| Domain | Customer churn prediction |
+| Dataset | KKBox WSDM 2018 challenge |
+| Champion | `xgboost_optuna_topk` |
+| Primary metric | Validation AUC-PR |
+| Secondary outputs | Test evaluation, SHAP, feature importances |
+| Delivery style | Reproducible ML pipeline with persisted artifacts |
+
+## Key Highlights
+
+- Snapshot-safe modeling frame built from a fixed cutoff date.
+- User-level behavioral and demographic feature engineering.
+- Baseline and advanced model candidates with champion selection.
+- Validation-threshold tuning to improve operational recall.
+- Persisted reports for comparison, evaluation, and interpretability.
+
+## Workflow
+
+```mermaid
+flowchart LR
+	A[Raw KKBox CSVs] --> B[Ingestion]
+	B --> C[Feature Engineering]
+	C --> D[Preprocessing]
+	D --> E[Model Training]
+	E --> F[Champion Selection]
+	F --> G[Test Evaluation]
+	F --> H[Feature Importance]
+	F --> I[SHAP Analysis]
+```
 
 ## Project Overview
 
 The objective is to predict whether a KKBox subscriber will churn after membership expiry using transaction history, listening logs, and member demographics.
 
-The pipeline is designed to:
-
-- build a snapshot-safe modeling frame using a fixed cutoff date,
-- engineer user-level behavioral and demographic features,
-- train baseline and advanced candidates,
-- select a champion by validation AUC-PR,
-- evaluate the champion on a held-out test split,
-- generate feature importance and SHAP interpretation artifacts,
-- keep the repo reproducible and audit-friendly.
+The pipeline keeps the full workflow reproducible: snapshot-safe feature engineering, model comparison, champion selection by validation AUC-PR, and offline interpretation outputs.
 
 ## Repository Structure
 
@@ -125,12 +157,12 @@ python -m pytest -q
 
 ## What Each Stage Does
 
-- `src.data.run_ingestion` reads the raw CSV files in chunks, applies the temporal cutoff, aggregates to user level, and writes compact Parquet artifacts to `data/interim/`.
-- `src.features.run_engineer` builds the leak-safe feature frame and metadata under `data/processed/`.
-- `src.features.run_preprocessing` creates the train/validation/test splits and saves the fitted preprocessor.
-- `src.models.run_train` trains all candidate models, logs to MLflow, writes `reports/model_comparison.csv`, and persists the champion.
-- `src.models.evaluate` loads the champion and writes `reports/test_evaluation.csv`.
-- `src.analysis.feature_importances` and `src.analysis.shap_analysis` generate the interpretation reports in `reports/`.
+- `src.data.run_ingestion`: chunked raw CSV ingestion and user-level aggregation into `data/interim/`.
+- `src.features.run_engineer`: leak-safe feature frame and metadata in `data/processed/`.
+- `src.features.run_preprocessing`: train/validation/test splits plus fitted preprocessor.
+- `src.models.run_train`: train candidates, log to MLflow, save `reports/model_comparison.csv`, persist the champion.
+- `src.models.evaluate`: score the held-out test split and write `reports/test_evaluation.csv`.
+- `src.analysis.feature_importances` / `src.analysis.shap_analysis`: interpretation reports in `reports/`.
 
 ## Notebooks
 
@@ -141,26 +173,7 @@ All notebooks are stored in valid Jupyter format with notebook-level metadata, s
 
 ## Generated Outputs
 
-Pipeline artifacts are written to the following locations:
-
-- `data/interim/modeling_frame.parquet`
-- `data/processed/feature_frame.parquet`
-- `data/processed/X_train.parquet`, `X_val.parquet`, `X_test.parquet`
-- `data/processed/y_train.parquet`, `y_val.parquet`, `y_test.parquet`
-- `data/processed/feature_metadata.json`
-- `models/preprocessor.pkl`
-- `models/champion_model.pkl`
-- `models/champion_name.txt`
-- `models/champion_threshold.txt`
-- `models/*.pkl` for trained models
-- `reports/model_comparison.csv`
-- `reports/test_evaluation.csv`
-- `reports/feature_importances.csv`
-- `reports/shap_summary.csv`
-- `reports/shap_beeswarm.png`
-- `reports/shap_top20.png`
-- `logs/feature_engineering.log`
-- `logs/training.log`
+Key artifacts: `data/interim/` and `data/processed/` for intermediate tables, `models/` for the champion and preprocessors, `reports/` for comparison/evaluation/SHAP outputs, and `logs/` for pipeline traces.
 
 ## Modeling Notes
 
