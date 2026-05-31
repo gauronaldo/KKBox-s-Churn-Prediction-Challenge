@@ -319,13 +319,16 @@ def train_logistic_regression(
         get_value(config, "project", "random_state", default=42)
     )
     params: dict[str, Any] = {
-        "solver":       str(get_value(config, "logistic_regression", "solver",       default="lbfgs")),
-        "penalty":      str(get_value(config, "logistic_regression", "penalty",      default="l2")),
-        "C":            float(get_value(config, "logistic_regression", "C",          default=0.1)),
-        "max_iter":     int(get_value(config, "logistic_regression", "max_iter",     default=1000)),
-        "class_weight": get_value(config, "logistic_regression", "class_weight",     default="balanced"),
+        "solver":       str(get_value(config, "logistic_regression", "solver",   default="lbfgs")),
+        "C":            float(get_value(config, "logistic_regression", "C",      default=1.0)),
+        "max_iter":     int(get_value(config, "logistic_regression", "max_iter", default=1000)),
         "random_state": random_state,
     }
+    # class_weight intentionally omitted: 'balanced' makes weight_pos*N_pos
+    # ~ weight_neg*N_neg, forcing the intercept-only solution sigmoid(b)~0.5
+    # for all users. Model instead learns natural P(churn)~0.064 probabilities.
+    # penalty intentionally omitted: lbfgs default is l2; explicit 'l2' triggers
+    # FutureWarning in sklearn 1.0+.
     logger.info("Training Logistic Regression | params=%s", params)
 
     model = LogisticRegression(**params)

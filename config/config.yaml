@@ -93,19 +93,17 @@ modeling:
 # class_weight (logistic_regression, random_forest) uses sklearn class weights.
 
 logistic_regression:
-  # lbfgs: sufficient for 56 features, stable quasi-Newton convergence.
   solver: lbfgs
-  # L2 penalty: never zeros out coefficients (unlike L1), every feature
-  # contributes a small amount. L1+class_weight='balanced' caused a sparse
-  # solution where only the intercept was active, collapsing all predict_proba
-  # to ~0.5 and giving an inverted AUC-ROC of 0.43.
-  penalty: l2
-  # C=0.1: moderate regularisation (10x stronger than default C=1.0).
-  # Stronger regularisation stabilises the solution when features are correlated
-  # and produces correct coefficient directions with class_weight='balanced'.
-  C: 0.1
+  # Do NOT pass penalty='l2' explicitly — deprecated in sklearn 1.0+.
+  # lbfgs default is already l2. Passing it explicitly triggers FutureWarning.
+  # class_weight='balanced' causes a fundamental failure: the balanced weighting
+  # makes weight_churn*N_churn ≈ weight_nonchurn*N_nonchurn, so the optimal
+  # intercept-only solution gives sigmoid(b) ≈ 0.5 for everyone. Combined with
+  # any regularization, the model stays at this all-0.5 solution (n_iter=8).
+  # Fix: no class_weight. Model learns natural P(churn)~0.064, then features
+  # push predictions up/down. Ranking is preserved -> AUC-ROC > 0.65.
+  C: 1.0
   max_iter: 1000
-  class_weight: balanced
 
 xgboost:
   n_estimators: 1000
