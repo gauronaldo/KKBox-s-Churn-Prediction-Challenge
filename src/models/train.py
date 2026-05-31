@@ -867,6 +867,10 @@ def run_training(
             "last_expire_date", "last_log_date",
             # Raw demographic columns superseded by derived features:
             "bd", "gender", "city", "registered_via",
+            # Raw listening-time columns: values reach ±3e11 after RobustScaler
+            # (near-zero IQR, heavy-tailed) → overwhelm L2 regularisation.
+            # Use log_total_secs / log_mean_secs instead (already in feature frame).
+            "total_secs", "mean_secs",
         }
         feat_cols = [c for c in ff.columns if c not in _LINEAR_DROP]
 
