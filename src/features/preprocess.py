@@ -544,6 +544,24 @@ def build_linear_preprocessor(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler",  RobustScaler(with_centering=True, with_scaling=True)),
+            # ── Clip extreme values after scaling ────────────────────────────
+            # Some features have post-RobustScaler values of ±3e11 (e.g. raw
+            # date integers or un-log-scaled counts with near-zero IQR).
+            # These values overwhelm L2 regularization: the solver is forced to
+            # shrink ALL coefficients (including the intercept) to ~0 to avoid
+            # numerical overflow, collapsing all predictions to sigmoid(0)=0.5.
+            #
+            # Clipping to [-10, 10] IQR-units is standard practice for LR:
+            #   - Normal features (well-scaled): values in [-2, 2], not clipped.
+            #   - Moderate outliers (up to 10 IQR-units): kept as-is.
+            #   - Extreme outliers (>10 IQR-units): capped at ±10, treated as
+            #     a "this user is an extreme outlier" soft indicator.
+            #
+            # Does NOT use get_feature_names_out(); compatible with all sklearn.
+            ("clip", FunctionTransformer(
+                lambda X: np.clip(X, -10.0, 10.0),
+                validate=False,
+            )),
         ]
     )
 
