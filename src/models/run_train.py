@@ -41,7 +41,6 @@ if __name__ == "__main__":
     logs_dir = PROJECT_ROOT / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     setup_logger("src.models.train", log_file=logs_dir / "training.log")
-    setup_logger(__name__,           log_file=logs_dir / "training.log")
 
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
