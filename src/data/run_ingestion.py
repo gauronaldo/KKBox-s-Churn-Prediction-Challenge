@@ -394,3 +394,17 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    config_path = PROJECT_ROOT / "config" / "config.yaml"
+    config = load_config(config_path)
+    interim_dir = get_path(config, "interim_dir")
+    if not interim_dir.is_absolute():
+        interim_dir = PROJECT_ROOT / interim_dir
+    print("Ingestion outputs written to:", interim_dir)
+    for name in [
+        "train.parquet",
+        "members.parquet",
+        "transactions_summary.parquet",
+        "user_logs_summary.parquet",
+        "modeling_frame.parquet",
+    ]:
+        print(" -", interim_dir / name)

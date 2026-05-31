@@ -540,6 +540,70 @@ def engineer_features(
             recent_days_window,
         )
 
+    # ---------------------------------------------------------------------
+    # Additional recency windows and simple trend/ratio features
+    # ---------------------------------------------------------------------
+    # Add binary flags for multiple short-term windows (7,14,30,90 days).
+    multi_windows = [7, 14, 30, 90]
+    for w in multi_windows:
+        col_name_tx = f"recent_transaction_{w}d"
+        col_name_log = f"recent_usage_{w}d"
+        if "days_since_last_transaction" in df.columns:
+            df[col_name_tx] = (df["days_since_last_transaction"] <= w).astype("int8")
+        if "days_since_last_log" in df.columns:
+            df[col_name_log] = (df["days_since_last_log"] <= w).astype("int8")
+
+    # Decay-based proxy counts: when raw per-window counts are unavailable
+    # we approximate short-term activity via exponential decay of aggregate
+    # totals using the recency days as a timescale. These are not exact
+    # counts but provide graded recency-weighted activity signals.
+    for w in multi_windows:
+        if "trans_count" in df.columns and "days_since_last_transaction" in df.columns:
+            df[f"trans_count_decay_{w}d"] = (
+                df["trans_count"].fillna(0) * np.exp(-df["days_since_last_transaction"].fillna(9999) / float(w))
+            )
+        if "total_secs" in df.columns and "days_since_last_log" in df.columns:
+            df[f"secs_decay_{w}d"] = (
+                df["total_secs"].fillna(0) * np.exp(-df["days_since_last_log"].fillna(9999) / float(w))
+            )
+        if "listen_events_total" in df.columns and "days_since_last_log" in df.columns:
+            df[f"listen_decay_{w}d"] = (
+                df["listen_events_total"].fillna(0) * np.exp(-df["days_since_last_log"].fillna(9999) / float(w))
+            )
+
+    # Simple ratio features that are robust to zero/NA via _safe_divide.
+    if {"total_spend", "active_days"}.issubset(df.columns):
+        df["spend_per_active_day"] = _safe_divide(df["total_spend"], df["active_days"])
+
+    if {"trans_count", "active_days"}.issubset(df.columns):
+        df["trans_per_active_day"] = _safe_divide(df["trans_count"], df["active_days"])
+
+    if {"mean_spend", "total_secs"}.issubset(df.columns):
+        df["spend_per_sec"] = _safe_divide(df["mean_spend"], df["total_secs"])
+
+    # Interaction features: combine recent activity signals with value metrics.
+    if "usage_to_spend_ratio" in df.columns and "recent_usage_flag" in df.columns:
+        df["recent_usage_value_interaction"] = (
+            df["usage_to_spend_ratio"].fillna(0) * df["recent_usage_flag"].astype(int)
+        )
+
+    if "retention_rate_from_transactions" in df.columns and "profile_completeness" in df.columns:
+        df["retention_profile_interaction"] = (
+            df["retention_rate_from_transactions"].fillna(0) * df["profile_completeness"].fillna(0)
+        )
+
+    # Robust z-score for secs_per_active_day as a trend/proxy signal. Use
+    # median and MAD so that outliers don't dominate the scaling.
+    if "secs_per_active_day" in df.columns:
+        median = df["secs_per_active_day"].median(skipna=True)
+        # Compute median absolute deviation (MAD) for robustness. Use the
+        # median of absolute deviations from the median as a stable scale.
+        mad = float(df["secs_per_active_day"].sub(median).abs().median(skipna=True) or 0)
+        # Avoid divide-by-zero: if mad is zero, fall back to 1.
+        mad = mad if mad > 0 else 1.0
+        df["secs_per_active_day_z"] = (df["secs_per_active_day"].fillna(median) - median) / mad
+        logger.debug("Computed 'secs_per_active_day_z' (median=%.2f, mad=%.2f).", median, mad)
+
     # -------------------------------------------------------------------------
     # 8. Missing-value indicators
     # -------------------------------------------------------------------------

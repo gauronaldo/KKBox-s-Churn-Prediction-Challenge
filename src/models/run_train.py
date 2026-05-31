@@ -54,3 +54,9 @@ if __name__ == "__main__":
     logger.info("Champion model : %s", champion.name)
     logger.info("Val AUC-PR     : %.4f", champion.val_metrics.auc_pr)
     logger.info("Val AUC-ROC    : %.4f", champion.val_metrics.auc_roc)
+    print("Training outputs written to:")
+    print(" -", PROJECT_ROOT / "models" / "champion_model.pkl")
+    print(" -", PROJECT_ROOT / "models" / "champion_name.txt")
+    print(" -", PROJECT_ROOT / "reports" / "model_comparison.csv")
+    for result in all_results:
+      print(" -", PROJECT_ROOT / "models" / f"{result.name}.pkl")

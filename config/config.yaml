@@ -15,6 +15,14 @@ paths:
   notebooks_dir: notebooks
   logs_dir: logs
 
+artifacts:
+  champion_model_file: champion_model.pkl
+  champion_name_file: champion_name.txt
+  champion_threshold_file: champion_threshold.txt
+  preprocessor_file: preprocessor.pkl
+  test_evaluation_file: test_evaluation.csv
+  predictions_file: predictions.csv
+
 data_files:
   train: train.csv
   members: members_v3.csv
@@ -65,11 +73,6 @@ feature_engineering:
   age_min: 7
   age_max: 70
   recent_days_window: 30
-  # Cutoff date: ALL transactions and logs AFTER this date are excluded.
-  # Must be BEFORE the churn observation window begins.
-  # KKBox cohort: memberships expire Feb-Mar 2017 -> cutoff = Jan 31, 2017.
-  # Using data from the observation window (Feb-Mar 2017) leaks the churn
-  # label because non-churners create renewal transactions in that period.
   cutoff_date: "2017-01-31"
   output_file: feature_frame.parquet
   metadata_file: feature_metadata.json
@@ -79,29 +82,36 @@ feature_engineering:
     - num_100
     - num_25
 
+eda:
+  preview_rows: 5
+  top_categories: 10
+  correlation_min_abs: 0.05
+  figure_dpi: 150
+
+analysis:
+  top_k_features: 30
+  lift_top_fraction: 0.1
+  shap_sample_size: null
+  shap_chunk_size: 5000
+  shap_beeswarm_sample_size: 5000
+  shap_max_display: 20
+  shap_figure_dpi: 150
+
 modeling:
   candidate_models:
     - logistic_regression
     - random_forest
     - xgboost
     - lightgbm
+  use_optuna_candidate: true
+  use_topk_candidate: true
   champion_metric: auc_pr
   decision_threshold: 0.5
-
-# ── Model hyperparameters ────────────────────────────────────────────────────
-# scale_pos_weight (xgboost, lightgbm) is computed dynamically as n_neg/n_pos.
-# class_weight (logistic_regression, random_forest) uses sklearn class weights.
+  decision_threshold_metric: f2
+  decision_threshold_grid_step: 0.01
 
 logistic_regression:
   solver: lbfgs
-  # Do NOT pass penalty='l2' explicitly — deprecated in sklearn 1.0+.
-  # lbfgs default is already l2. Passing it explicitly triggers FutureWarning.
-  # class_weight='balanced' causes a fundamental failure: the balanced weighting
-  # makes weight_churn*N_churn ≈ weight_nonchurn*N_nonchurn, so the optimal
-  # intercept-only solution gives sigmoid(b) ≈ 0.5 for everyone. Combined with
-  # any regularization, the model stays at this all-0.5 solution (n_iter=8).
-  # Fix: no class_weight. Model learns natural P(churn)~0.064, then features
-  # push predictions up/down. Ranking is preserved -> AUC-ROC > 0.65.
   C: 1.0
   max_iter: 1000
 
@@ -115,16 +125,17 @@ xgboost:
   eval_metric: aucpr
   early_stopping_rounds: 100
   log_eval_period: 100
+  n_jobs: -1
 
 lightgbm:
-  metric: auc           # early stopping monitors AUC-ROC (stable, higher=better)
+  metric: auc
   n_estimators: 1000
   learning_rate: 0.03
   num_leaves: 31
   max_depth: -1
-  min_child_samples: 50     # regularisation: min samples per leaf
-  reg_alpha: 0.1            # L1 regularisation
-  reg_lambda: 1.0           # L2 regularisation
+  min_child_samples: 50
+  reg_alpha: 0.1
+  reg_lambda: 1.0
   subsample: 0.8
   colsample_bytree: 0.8
   early_stopping_rounds: 100
@@ -132,21 +143,24 @@ lightgbm:
 
 random_forest:
   n_estimators: 300
-  # max_depth 20->15: train/val AUC-PR gap was 0.22 (OVERFIT)
   max_depth: 15
   min_samples_split: 2
-  # min_samples_leaf 10->30: stronger leaf regularisation
   min_samples_leaf: 30
   n_jobs: -1
-  # balanced_subsample: re-computes class weights per bootstrap sample.
-  # Better than 'balanced' (global weights) for RF ensemble methods.
   class_weight: balanced_subsample
 
 optuna:
-  n_trials: 50
+  n_trials: 20
   timeout: null
   direction: maximize
   metric: auc_pr
+  tune_top_k: true
+  top_k_min: 10
+  top_k_max: 100
+  top_k_step: 5
+  verbose_eval: 25
+  early_stopping_rounds: 50
+  num_boost_round: 1000
 
 mlflow:
   experiment_name: kkbox-churn-prediction

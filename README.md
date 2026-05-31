@@ -1,69 +1,89 @@
 # KKBox Churn Prediction
 
-> WSDM 2018 churn prediction. Portfolio project with a leak-safe snapshot pipeline, persisted artifacts, and notebook-based sanity checks.
+![Python](https://img.shields.io/badge/python-3.11-blue.svg)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-1.8.0-orange.svg)
+![XGBoost](https://img.shields.io/badge/XGBoost-3.2.0-brightgreen.svg)
+![LightGBM](https://img.shields.io/badge/LightGBM-4.6.0-green.svg)
+![Optuna](https://img.shields.io/badge/Optuna-4.9.0-purple.svg)
+![MLflow](https://img.shields.io/badge/MLflow-3.12.0-blueviolet.svg)
+![Pytest](https://img.shields.io/badge/testing-pytest-blue.svg)
+![Ruff](https://img.shields.io/badge/linting-ruff-000000.svg)
 
-This repo predicts whether a KKBox subscriber will churn after membership expiry using transaction history, listening logs, and member demographics. The current codebase is organized as a reproducible pipeline from ingestion to training.
+Leak-safe churn prediction pipeline for the WSDM 2018 KKBox challenge.
 
-## Current Status
+This repository is organized as a reproducible machine learning project. Raw data ingestion, feature engineering, preprocessing, model training, evaluation, and interpretation are all driven by code and persisted artifacts instead of notebook state.
 
-The current training run is stable and ready to push.
+## Project Overview
 
-Current validation results:
+The objective is to predict whether a KKBox subscriber will churn after membership expiry using transaction history, listening logs, and member demographics.
 
-| Model | val AUC-ROC | val AUC-PR | Lift@10% | Train/Val gap |
-|---|---:|---:|---:|---:|
-| **XGBoost** | **0.8807** | **0.4881** | **6.19x** | **+0.0494** |
-| LightGBM | 0.8811 | 0.4866 | 6.23x | +0.0317 |
-| Random Forest | 0.8784 | 0.4800 | 6.12x | +0.0782 |
-| Logistic Regression | 0.8302 | 0.3767 | 5.51x | +0.0027 |
+The pipeline is designed to:
 
-Notes:
-- The Kaggle competition metric is Log Loss.
-- This repo uses AUC-PR and AUC-ROC internally for model comparison and portfolio reporting.
-- The pipeline uses a fixed cutoff date (`2017-01-31`) to avoid temporal leakage.
+- build a snapshot-safe modeling frame using a fixed cutoff date,
+- engineer user-level behavioral and demographic features,
+- train baseline and advanced candidates,
+- select a champion by validation AUC-PR,
+- evaluate the champion on a held-out test split,
+- generate feature importance and SHAP interpretation artifacts,
+- keep the repo reproducible and audit-friendly.
 
-## Repository Layout
+## Repository Structure
 
 ```text
 project_churn_prediction/
-├── config/
-│   └── config.yaml              # Paths, split sizes, cutoff date, and model hyperparameters
-├── data/
-│   ├── raw/                     # Source CSVs
-│   ├── interim/                 # Ingested modeling frame
-│   └── processed/               # Feature frame and train/val/test splits
-├── logs/                        # Runtime logs
-├── models/                      # Saved model artifacts and preprocessor
-├── notebooks/
-│   ├── debug_pipeline.ipynb      # Full interactive pipeline notebook
-│   ├── pipeline_healthcheck.ipynb# End-to-end sanity check notebook
-│   └── training_debug.ipynb     # Training diagnostics notebook
-├── reports/
-│   └── model_comparison.csv      # Saved comparison table
-├── src/
-│   ├── data/
-│   │   ├── loader.py
-│   │   ├── merger.py
-│   │   └── run_ingestion.py
-│   ├── features/
-│   │   ├── engineer.py
-│   │   ├── pipeline.py
-│   │   ├── preprocess.py
-│   │   ├── run_engineer.py
-│   │   └── run_preprocessing.py
-│   ├── models/
-│   │   ├── train.py
-│   │   └── run_train.py
-│   └── utils/
-│       ├── config.py
-│       └── logger.py
-├── requirements.txt
-└── README.md
+|-- config/
+|   `-- config.yaml
+|-- data/
+|   |-- raw/
+|   |-- interim/
+|   `-- processed/
+|-- logs/
+|-- models/
+|-- notebooks/
+|   |-- eda.ipynb
+|   |-- debug_pipeline.ipynb
+|   `-- feature_analysis.ipynb
+|-- reports/
+|-- src/
+|   |-- analysis/
+|   |-- data/
+|   |-- features/
+|   |-- models/
+|   `-- utils/
+|-- tests/
+|-- MODEL_CARD.md
+|-- requirements.txt
+|-- requirements-dev.txt
+`-- README.md
 ```
 
-## How to Run
+## Current Status
 
-### 1) Setup
+- Active champion: `xgboost_optuna_topk`
+- Official comparison table: `reports/model_comparison.csv`
+- Held-out evaluation: `reports/test_evaluation.csv`
+- Interpretation outputs: `reports/feature_importances.csv`, `reports/shap_summary.csv`, `reports/shap_beeswarm.png`, `reports/shap_top20.png`
+
+### Model Comparison
+
+| Model | Val AUC-PR | Val Recall | Val Precision | Decision Threshold |
+|---|---:|---:|---:|---:|
+| xgboost_optuna_topk | 0.5142 | 0.7072 | 0.3343 | 0.11 |
+| xgboost_topk | 0.4999 | 0.7105 | 0.3300 | 0.63 |
+| xgboost | 0.4996 | 0.7225 | 0.3190 | 0.59 |
+| lightgbm | 0.4963 | 0.7042 | 0.3339 | 0.64 |
+| random_forest | 0.4813 | 0.6984 | 0.3256 | 0.50 |
+| logistic_regression | 0.3995 | 0.6866 | 0.2750 | 0.08 |
+
+## Installation
+
+### Prerequisites
+
+- Python 3.11
+- Git
+- Optional: a GPU is not required for this churn pipeline
+
+### Setup Environment
 
 ```bash
 python -m venv venv
@@ -71,74 +91,89 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2) Pipeline order
+If you only want the runtime pipeline, `requirements.txt` is enough. Keep `requirements-dev.txt` installed when you need notebooks, tests, or linting.
+
+## Quick Start
+
+### 1. Prepare Data
+
+Place the raw KKBox CSV files in `data/raw/`:
+
+- `train.csv`
+- `members_v3.csv`
+- `transactions.csv`
+- `user_logs.csv`
+
+### 2. Run the End-to-End Pipeline
 
 ```bash
 python -m src.data.run_ingestion
 python -m src.features.run_engineer
 python -m src.features.run_preprocessing
 python -m src.models.run_train
+python -m src.models.evaluate
+python -m src.analysis.feature_importances
+python -m src.analysis.shap_analysis
 ```
 
-### 3) Notebook workflow
+### 3. Smoke Checks
 
-- `notebooks/debug_pipeline.ipynb` for the full interactive pipeline and detailed diagnostics.
-- `notebooks/pipeline_healthcheck.ipynb` for a compact end-to-end verification pass.
-- `notebooks/training_debug.ipynb` for training-only analysis and coefficient inspection.
+```bash
+python -m src.data.validate_artifacts
+python -m pytest -q
+```
 
-## Feature Engineering
+## What Each Stage Does
 
-The current feature pipeline builds leak-safe user-level features from the raw tables using a fixed snapshot cutoff.
+- `src.data.run_ingestion` reads the raw CSV files in chunks, applies the temporal cutoff, aggregates to user level, and writes compact Parquet artifacts to `data/interim/`.
+- `src.features.run_engineer` builds the leak-safe feature frame and metadata under `data/processed/`.
+- `src.features.run_preprocessing` creates the train/validation/test splits and saves the fitted preprocessor.
+- `src.models.run_train` trains all candidate models, logs to MLflow, writes `reports/model_comparison.csv`, and persists the champion.
+- `src.models.evaluate` loads the champion and writes `reports/test_evaluation.csv`.
+- `src.analysis.feature_importances` and `src.analysis.shap_analysis` generate the interpretation reports in `reports/`.
 
-Key feature groups:
+## Notebooks
 
-| Category | Examples |
-|---|---|
-| Transaction behavior | `trans_count`, `cancel_rate`, `auto_renew_rate`, `retention_rate_from_transactions` |
-| Recency | `days_since_last_transaction`, `days_since_last_log`, `recent_transaction_flag` |
-| Subscription value | `mean_plan_price`, `total_spend`, `mean_plan_days` |
-| Listening behavior | `total_secs`, `mean_secs`, `total_unq`, `mean_completion_rate` |
-| Demographics | `age_clean`, `gender_clean`, `city_clean`, `member_age_days` |
-| Missingness flags | `gender_missing`, `registration_init_time_missing`, `last_log_date_missing` |
+- `notebooks/eda.ipynb` documents exploratory analysis and data-quality checks.
+- `notebooks/feature_analysis.ipynb` reviews feature importance and SHAP outputs.
 
-## Output Locations
+All notebooks are stored in valid Jupyter format with notebook-level metadata, so they can be opened directly in VS Code or Jupyter.
 
-The scripts write artifacts to these locations:
+## Generated Outputs
+
+Pipeline artifacts are written to the following locations:
 
 - `data/interim/modeling_frame.parquet`
 - `data/processed/feature_frame.parquet`
 - `data/processed/X_train.parquet`, `X_val.parquet`, `X_test.parquet`
 - `data/processed/y_train.parquet`, `y_val.parquet`, `y_test.parquet`
+- `data/processed/feature_metadata.json`
 - `models/preprocessor.pkl`
 - `models/champion_model.pkl`
 - `models/champion_name.txt`
-- `models/*.pkl` for each trained model
+- `models/champion_threshold.txt`
+- `models/*.pkl` for trained models
 - `reports/model_comparison.csv`
+- `reports/test_evaluation.csv`
+- `reports/feature_importances.csv`
+- `reports/shap_summary.csv`
+- `reports/shap_beeswarm.png`
+- `reports/shap_top20.png`
 - `logs/feature_engineering.log`
 - `logs/training.log`
 
-MLflow is configured for local tracking as well. If enabled, artifacts are logged under `mlruns/`.
+## Modeling Notes
 
-## Configuration
+- Logistic Regression uses a separate OneHot + RobustScaler preprocessing path.
+- Tree-based models use ordinal-encoded splits.
+- XGBoost and LightGBM use early stopping on validation metrics.
+- The champion threshold is tuned on validation data and persisted to `models/champion_threshold.txt`.
+- MLflow logging is enabled for training runs when configured.
 
-All runtime controls live in `config/config.yaml`.
+## Troubleshooting
 
-Important values:
+- If a notebook does not open, verify that the file still has valid `.ipynb` JSON structure and notebook metadata.
+- If training fails, confirm that the raw CSVs exist in `data/raw/` and that `python -m src.data.run_ingestion` completed successfully.
+- If SHAP or Optuna imports fail, confirm that `requirements.txt` and `requirements-dev.txt` are installed in the active environment.
+- If VS Code shows a webview or service worker error, reload the window, restart VS Code, and reopen the notebook tab.
 
-- `feature_engineering.cutoff_date`: `2017-01-31`
-- `split.validation_size` and `split.test_size`
-- `modeling.candidate_models`
-- `modeling.champion_metric`: `auc_pr`
-
-## Notes
-
-- The project is portfolio-oriented, but the implementation remains production-minded: fixed snapshot cutoffs, persisted artifacts, explicit logs, and notebook sanity checks.
-- Logistic Regression uses a separate OneHot-based linear preprocessor, while tree models use the ordinal preprocessed splits.
-- The current champion is `xgboost`; performance is balanced and the train/val gap is not showing severe overfit.
-
-## Next Improvements
-
-- Hyperparameter tuning for XGBoost and LightGBM
-- Held-out test evaluation report
-- Inference script for scoring new users
-- Business-cost analysis for threshold selection

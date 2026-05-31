@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder, RobustScaler
 
@@ -828,9 +829,6 @@ def run_preprocessing(
     target_col: str = str(
         get_value(config, "project", "target_col", default="is_churn")
     )
-    id_col: str = str(
-        get_value(config, "project", "id_col", default="msno")
-    )
 
     # -------------------------------------------------------------------------
     # 1. Load feature frame
@@ -852,10 +850,68 @@ def run_preprocessing(
     frame = pd.read_parquet(feature_frame_path)
     logger.info("Feature frame loaded | shape=%s", frame.shape)
 
+    # ---------------------------------------------------------------------
+    # Optional CV target encoding for specified categorical columns
+    # ---------------------------------------------------------------------
+    te_cols = list(
+        get_value(config, "feature_engineering", "target_encode_columns", default=[])
+    )
+    if te_cols:
+        logger.info("Applying CV target encoding to columns: %s", te_cols)
+        # We will perform encoding in-place on a copy of the frame to avoid
+        # mutating the upstream artifact.
+        frame = frame.copy()
+        # We'll compute encoders using the split defined below, so postpone
+        # heavy per-split mapping until after split_dataset() creates train/val/test.
+
     # -------------------------------------------------------------------------
     # 2. Split into train / val / test
     # -------------------------------------------------------------------------
     train_df, val_df, test_df = split_dataset(frame, config)
+
+    # If CV target-encoding requested, compute out-of-fold encodings using
+    # training folds and apply to val/test. Encoded columns are added with
+    # suffix `_te` and raw columns are left for possible dropping later.
+    if te_cols:
+        def _cv_encode_column(col: str, n_splits: int = 5, smoothing: float = 10.0):
+            # Prepare arrays
+            X_col = train_df[col].astype(object)
+            y = train_df[target_col]
+            oof = pd.Series(index=train_df.index, dtype=float)
+            kf = KFold(n_splits=n_splits, shuffle=True, random_state=int(get_value(config, 'project', 'random_state', default=42)))
+            global_mean = float(y.mean())
+            for train_idx, val_idx in kf.split(X_col):
+                tr_vals = X_col.iloc[train_idx]
+                tr_y = y.iloc[train_idx]
+                stats = tr_y.groupby(tr_vals).agg(['mean','count'])
+                means = stats['mean']
+                counts = stats['count']
+                smooth = (counts * means + smoothing * global_mean) / (counts + smoothing)
+                mapped = X_col.iloc[val_idx].map(smooth)
+                oof.iloc[val_idx] = mapped
+            # Fill any remaining NaN with global mean
+            oof = oof.fillna(global_mean)
+            # Build mapping from full training set for val/test application
+            full_stats = y.groupby(train_df[col]).agg(['mean','count'])
+            full_means = full_stats['mean']
+            full_counts = full_stats['count']
+            full_smooth = (full_counts * full_means + smoothing * global_mean) / (full_counts + smoothing)
+            # Apply to val and test
+            val_mapped = val_df[col].map(full_smooth).fillna(global_mean)
+            test_mapped = test_df[col].map(full_smooth).fillna(global_mean)
+            return oof.rename(f"{col}_te"), val_mapped.rename(f"{col}_te"), test_mapped.rename(f"{col}_te")
+
+        te_n_splits = int(get_value(config, 'feature_engineering', 'target_encode_splits', default=5))
+        te_smoothing = float(get_value(config, 'feature_engineering', 'target_encode_smoothing', default=10.0))
+        for col in te_cols:
+            if col not in train_df.columns:
+                logger.warning("Requested TE column '%s' not found in frame; skipping.", col)
+                continue
+            oof_col, val_col, test_col = _cv_encode_column(col, n_splits=te_n_splits, smoothing=te_smoothing)
+            train_df[oof_col.name] = oof_col
+            val_df[val_col.name] = val_col
+            test_df[test_col.name] = test_col
+        logger.info("CV target-encoding complete. Encoded columns added with suffix _te.")
 
     # Separate features from labels. Keep msno in X for traceability; it is
     # listed in _NON_FEATURE_COLS so ColumnTransformer will drop it.

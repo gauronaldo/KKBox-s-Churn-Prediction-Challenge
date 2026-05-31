@@ -4,13 +4,16 @@ Workflow
 --------
 1. Load preprocessed train / validation splits from ``data/processed/``.
 2. Load the raw feature frame and build a OneHot linear preprocessor for LR.
-3. Train all candidate models under MLflow tracking:
+3. Train all baseline candidate models under MLflow tracking:
    - Logistic Regression  (OneHot + RobustScaler)
    - Random Forest        (OrdinalEncoded, tree-native)
    - XGBoost              (OrdinalEncoded, scale_pos_weight)
    - LightGBM             (OrdinalEncoded, scale_pos_weight)
-4. Select the champion by highest validation AUC-PR.
-5. Persist the champion model and a full comparison table.
+4. Train advanced XGBoost candidates as official contenders:
+    - Optuna-tuned XGBoost
+    - Top-K-features XGBoost (based on baseline XGB gain ranking)
+5. Select the champion by highest validation AUC-PR across all contenders.
+6. Persist the champion model and a full comparison table.
 
 Design decisions
 ----------------
@@ -41,6 +44,7 @@ import mlflow
 import mlflow.lightgbm
 import mlflow.sklearn
 import numpy as np
+import optuna
 import pandas as pd
 import xgboost as xgb
 from sklearn.ensemble import RandomForestClassifier
@@ -48,6 +52,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
     f1_score,
+    fbeta_score,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -59,6 +64,8 @@ from src.features.preprocess import (
     identify_column_groups,
     split_dataset,
 )
+from src.models.booster_model import BoosterModel
+from src.models.feature_subset_model import FeatureSubsetModel
 from src.utils.config import get_value
 
 logger = logging.getLogger(__name__)
@@ -144,6 +151,7 @@ class ModelResult:
     val_metrics: MetricsBundle
     mlflow_run_id: str | None = None
     best_iteration: int = 0
+    decision_threshold: float = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +209,43 @@ def _compute_metrics(
         recall=float(recall_score(y_true, y_pred, zero_division=0)),
         lift_at_top10=_lift_at_top_k(y_true, y_score, k=0.10),
     )
+
+
+def _tune_decision_threshold(
+    y_true: pd.Series | np.ndarray,
+    y_score: np.ndarray,
+    *,
+    metric: str = "f2",
+    grid_step: float = 0.01,
+) -> float:
+    """Pick a classification threshold on validation scores.
+
+    The default metric is F2 so the operating point is biased toward recall,
+    which is more appropriate for churn targeting than the default 0.5 cutoff.
+    """
+
+    y_true_arr = np.asarray(y_true).ravel().astype(int)
+    thresholds = np.arange(grid_step, 1.0, grid_step)
+    if thresholds.size == 0:
+        return 0.5
+
+    best_threshold = 0.5
+    best_score = float("-inf")
+
+    for threshold in thresholds:
+        y_pred = (y_score >= threshold).astype(int)
+        if metric == "f1":
+            score = float(f1_score(y_true_arr, y_pred, zero_division=0))
+        elif metric == "f2":
+            score = float(fbeta_score(y_true_arr, y_pred, beta=2.0, zero_division=0))
+        else:
+            raise ValueError(f"Unsupported decision threshold metric: {metric}")
+
+        if score > best_score:
+            best_score = score
+            best_threshold = float(threshold)
+
+    return best_threshold
 
 
 def _scale_pos_weight(y_train: pd.Series | np.ndarray) -> float:
@@ -263,11 +308,12 @@ def _log_to_mlflow(
 
             if result.best_iteration > 0:
                 mlflow.log_param("best_iteration", result.best_iteration)
+            mlflow.log_param("decision_threshold", result.decision_threshold)
 
             if isinstance(result.model, lgb.LGBMClassifier):
-                mlflow.lightgbm.log_model(result.model, artifact_path="model")
+                mlflow.lightgbm.log_model(result.model, name="model")
             else:
-                mlflow.sklearn.log_model(result.model, artifact_path="model")
+                mlflow.sklearn.log_model(result.model, name="model")
 
             run_id = run.info.run_id
             logger.info(
@@ -337,8 +383,17 @@ def train_logistic_regression(
     train_score = model.predict_proba(X_train)[:, 1]
     val_score   = model.predict_proba(X_val)[:, 1]
 
-    train_metrics = _compute_metrics(y_train, train_score, threshold)
-    val_metrics   = _compute_metrics(y_val,   val_score,   threshold)
+    threshold_metric = str(get_value(config, "modeling", "decision_threshold_metric", default="f2"))
+    threshold_grid_step = float(get_value(config, "modeling", "decision_threshold_grid_step", default=0.01))
+    tuned_threshold = _tune_decision_threshold(
+        y_val,
+        val_score,
+        metric=threshold_metric,
+        grid_step=threshold_grid_step,
+    )
+
+    train_metrics = _compute_metrics(y_train, train_score, tuned_threshold)
+    val_metrics   = _compute_metrics(y_val,   val_score,   tuned_threshold)
 
     logger.info(
         "Logistic Regression | val_auc_roc=%.4f  val_auc_pr=%.4f  "
@@ -353,6 +408,7 @@ def train_logistic_regression(
         params=params,
         train_metrics=train_metrics,
         val_metrics=val_metrics,
+        decision_threshold=tuned_threshold,
     )
 
 
@@ -400,8 +456,17 @@ def train_random_forest(
     train_score = model.predict_proba(X_train)[:, 1]
     val_score   = model.predict_proba(X_val)[:, 1]
 
-    train_metrics = _compute_metrics(y_train, train_score, threshold)
-    val_metrics   = _compute_metrics(y_val,   val_score,   threshold)
+    threshold_metric = str(get_value(config, "modeling", "decision_threshold_metric", default="f2"))
+    threshold_grid_step = float(get_value(config, "modeling", "decision_threshold_grid_step", default=0.01))
+    tuned_threshold = _tune_decision_threshold(
+        y_val,
+        val_score,
+        metric=threshold_metric,
+        grid_step=threshold_grid_step,
+    )
+
+    train_metrics = _compute_metrics(y_train, train_score, tuned_threshold)
+    val_metrics   = _compute_metrics(y_val,   val_score,   tuned_threshold)
 
     logger.info(
         "Random Forest | val_auc_roc=%.4f  val_auc_pr=%.4f  "
@@ -483,8 +548,17 @@ def train_xgboost(
     train_score = model.predict_proba(X_train)[:, 1]
     val_score   = model.predict_proba(X_val)[:, 1]
 
-    train_metrics = _compute_metrics(y_train, train_score, threshold)
-    val_metrics   = _compute_metrics(y_val,   val_score,   threshold)
+    threshold_metric = str(get_value(config, "modeling", "decision_threshold_metric", default="f2"))
+    threshold_grid_step = float(get_value(config, "modeling", "decision_threshold_grid_step", default=0.01))
+    tuned_threshold = _tune_decision_threshold(
+        y_val,
+        val_score,
+        metric=threshold_metric,
+        grid_step=threshold_grid_step,
+    )
+
+    train_metrics = _compute_metrics(y_train, train_score, tuned_threshold)
+    val_metrics   = _compute_metrics(y_val,   val_score,   tuned_threshold)
 
     logger.info(
         "XGBoost | best_iter=%d  val_auc_roc=%.4f  val_auc_pr=%.4f  "
@@ -501,6 +575,7 @@ def train_xgboost(
         train_metrics=train_metrics,
         val_metrics=val_metrics,
         best_iteration=best_iter,
+        decision_threshold=tuned_threshold,
     )
 
 
@@ -587,8 +662,17 @@ def train_lightgbm(
     train_score = model.predict_proba(X_train)[:, 1]
     val_score   = model.predict_proba(X_val)[:, 1]
 
-    train_metrics = _compute_metrics(y_train, train_score, threshold)
-    val_metrics   = _compute_metrics(y_val,   val_score,   threshold)
+    threshold_metric = str(get_value(config, "modeling", "decision_threshold_metric", default="f2"))
+    threshold_grid_step = float(get_value(config, "modeling", "decision_threshold_grid_step", default=0.01))
+    tuned_threshold = _tune_decision_threshold(
+        y_val,
+        val_score,
+        metric=threshold_metric,
+        grid_step=threshold_grid_step,
+    )
+
+    train_metrics = _compute_metrics(y_train, train_score, tuned_threshold)
+    val_metrics   = _compute_metrics(y_val,   val_score,   tuned_threshold)
 
     logger.info(
         "LightGBM | best_iter=%d  val_auc_roc=%.4f  val_auc_pr=%.4f  "
@@ -605,6 +689,252 @@ def train_lightgbm(
         train_metrics=train_metrics,
         val_metrics=val_metrics,
         best_iteration=best_iter,
+        decision_threshold=tuned_threshold,
+    )
+
+
+def train_xgboost_optuna_candidate(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    config: Mapping[str, Any],
+    base_xgb_result: ModelResult,
+    threshold: float = 0.5,
+) -> ModelResult:
+    """Train an Optuna-tuned XGBoost candidate with optional auto top-K search."""
+
+    random_state = int(get_value(config, "project", "random_state", default=42))
+    n_trials = int(get_value(config, "optuna", "n_trials", default=50))
+    timeout = get_value(config, "optuna", "timeout", default=None)
+    num_boost_round = int(get_value(config, "optuna", "num_boost_round", default=1000))
+    early_stopping = int(get_value(config, "optuna", "early_stopping_rounds", default=50))
+    verbose_eval = int(get_value(config, "optuna", "verbose_eval", default=25))
+    direction = str(get_value(config, "optuna", "direction", default="maximize"))
+    eval_metric = str(get_value(config, "xgboost", "eval_metric", default="aucpr"))
+    tune_top_k = bool(get_value(config, "optuna", "tune_top_k", default=True))
+    top_k_min = int(get_value(config, "optuna", "top_k_min", default=10))
+    top_k_max = int(get_value(config, "optuna", "top_k_max", default=100))
+    top_k_step = int(get_value(config, "optuna", "top_k_step", default=5))
+
+    base_booster = base_xgb_result.model.get_booster()
+    gain_map = base_booster.get_score(importance_type="gain")
+    ranked_features = [
+        feat
+        for feat, _ in sorted(gain_map.items(), key=lambda kv: kv[1], reverse=True)
+        if feat in X_train.columns
+    ]
+    if not ranked_features:
+        ranked_features = list(X_train.columns)
+
+    k_min = max(1, min(top_k_min, len(ranked_features)))
+    k_max = max(k_min, min(top_k_max, len(ranked_features)))
+
+    y_train_arr = np.asarray(y_train).ravel()
+    y_val_arr = np.asarray(y_val).ravel()
+
+    def objective(trial: optuna.Trial) -> float:
+        if tune_top_k:
+            top_k = trial.suggest_int("top_k", k_min, k_max, step=top_k_step)
+        else:
+            top_k = len(ranked_features)
+        selected = ranked_features[:top_k]
+
+        dtrain = xgb.DMatrix(
+            X_train[selected].values,
+            label=y_train_arr,
+            feature_names=selected,
+        )
+        dval = xgb.DMatrix(
+            X_val[selected].values,
+            label=y_val_arr,
+            feature_names=selected,
+        )
+
+        params = {
+            "objective": "binary:logistic",
+            "eval_metric": eval_metric,
+            "booster": "gbtree",
+            "eta": trial.suggest_float("eta", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "lambda": trial.suggest_float("lambda", 1e-3, 10.0, log=True),
+            "alpha": trial.suggest_float("alpha", 1e-3, 10.0, log=True),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+            "seed": random_state,
+            "verbosity": 0,
+        }
+        booster = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=num_boost_round,
+            evals=[(dval, "valid")],
+            early_stopping_rounds=early_stopping,
+            verbose_eval=verbose_eval,
+        )
+        trial.set_user_attr("best_iteration", int(booster.best_iteration))
+        trial.set_user_attr("best_ntree_limit", int(booster.best_iteration) + 1)
+        trial.set_user_attr("top_k", int(top_k))
+        return float(booster.best_score)
+
+    logger.info("Training Optuna XGBoost candidate | n_trials=%d", n_trials)
+    study = optuna.create_study(direction=direction)
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
+
+    best = study.best_params
+    best_trial = study.best_trial
+    best_iteration = int(best_trial.user_attrs.get("best_iteration", 0))
+    best_ntree_limit = int(best_trial.user_attrs.get("best_ntree_limit", best_iteration + 1))
+    best_top_k = int(best_trial.user_attrs.get("top_k", len(ranked_features)))
+    selected_features = ranked_features[:best_top_k]
+
+    final_params = best.copy()
+    final_params.update(
+        {
+            "objective": "binary:logistic",
+            "eval_metric": eval_metric,
+            "seed": random_state,
+            "verbosity": 0,
+        }
+    )
+    dtrain_final = xgb.DMatrix(
+        X_train[selected_features].values,
+        label=y_train_arr,
+        feature_names=selected_features,
+    )
+    dval_final = xgb.DMatrix(
+        X_val[selected_features].values,
+        label=y_val_arr,
+        feature_names=selected_features,
+    )
+
+    final_booster = xgb.train(
+        final_params,
+        dtrain_final,
+        num_boost_round=best_ntree_limit,
+        evals=[(dval_final, "valid")],
+        verbose_eval=verbose_eval,
+    )
+
+    train_score = final_booster.predict(dtrain_final)
+    val_score = final_booster.predict(dval_final)
+
+    threshold_metric = str(get_value(config, "modeling", "decision_threshold_metric", default="f2"))
+    threshold_grid_step = float(get_value(config, "modeling", "decision_threshold_grid_step", default=0.01))
+    tuned_threshold = _tune_decision_threshold(
+        y_val,
+        val_score,
+        metric=threshold_metric,
+        grid_step=threshold_grid_step,
+    )
+
+    train_metrics = _compute_metrics(y_train, train_score, tuned_threshold)
+    val_metrics = _compute_metrics(y_val, val_score, tuned_threshold)
+
+    model = FeatureSubsetModel(
+        model=BoosterModel(final_booster, selected_features),
+        feature_names=selected_features,
+    )
+    params_out = dict(final_params)
+    params_out["best_optuna_val_aucpr"] = float(study.best_value)
+    params_out["best_ntree_limit"] = int(best_ntree_limit)
+    params_out["selected_top_k"] = int(best_top_k)
+    params_out["feature_count"] = int(len(selected_features))
+
+    return ModelResult(
+        name="xgboost_optuna_topk",
+        model=model,
+        params=params_out,
+        train_metrics=train_metrics,
+        val_metrics=val_metrics,
+        best_iteration=best_iteration,
+        decision_threshold=tuned_threshold,
+    )
+
+
+def train_xgboost_topk_candidate(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    config: Mapping[str, Any],
+    base_xgb_result: ModelResult,
+    threshold: float = 0.5,
+) -> ModelResult:
+    """Train a top-K-features XGBoost candidate for champion selection."""
+
+    top_k = int(get_value(config, "analysis", "top_k_features", default=30))
+    booster = base_xgb_result.model.get_booster()
+    gain_map = booster.get_score(importance_type="gain")
+    if not gain_map:
+        raise ValueError("Top-K candidate requires XGBoost gain importances, but none were found.")
+
+    ranked_features = [
+        feat
+        for feat, _ in sorted(gain_map.items(), key=lambda kv: kv[1], reverse=True)
+        if feat in X_train.columns
+    ]
+    selected_features = ranked_features[:top_k]
+    if not selected_features:
+        raise ValueError("Top-K candidate found no overlapping features in training matrix.")
+
+    logger.info("Training top-K XGBoost candidate | top_k=%d | selected=%d", top_k, len(selected_features))
+    X_train_topk = X_train[selected_features]
+    X_val_topk = X_val[selected_features]
+
+    params = {
+        "n_estimators": int(get_value(config, "xgboost", "n_estimators", default=1000)),
+        "learning_rate": float(get_value(config, "xgboost", "learning_rate", default=0.05)),
+        "max_depth": int(get_value(config, "xgboost", "max_depth", default=6)),
+        "subsample": float(get_value(config, "xgboost", "subsample", default=0.8)),
+        "colsample_bytree": float(get_value(config, "xgboost", "colsample_bytree", default=0.8)),
+        "tree_method": str(get_value(config, "xgboost", "tree_method", default="hist")),
+        "eval_metric": str(get_value(config, "xgboost", "eval_metric", default="aucpr")),
+        "early_stopping_rounds": int(get_value(config, "xgboost", "early_stopping_rounds", default=100)),
+        "scale_pos_weight": _scale_pos_weight(y_train),
+        "random_state": int(get_value(config, "project", "random_state", default=42)),
+        "n_jobs": -1,
+        "verbosity": 0,
+    }
+    log_eval_period = int(get_value(config, "xgboost", "log_eval_period", default=100))
+
+    model = xgb.XGBClassifier(**params)
+    model.fit(
+        X_train_topk,
+        y_train,
+        eval_set=[(X_val_topk, y_val)],
+        verbose=log_eval_period,
+    )
+
+    best_iter = int(model.best_iteration) if hasattr(model, "best_iteration") else int(params["n_estimators"])
+    train_score = model.predict_proba(X_train_topk)[:, 1]
+    val_score = model.predict_proba(X_val_topk)[:, 1]
+
+    threshold_metric = str(get_value(config, "modeling", "decision_threshold_metric", default="f2"))
+    threshold_grid_step = float(get_value(config, "modeling", "decision_threshold_grid_step", default=0.01))
+    tuned_threshold = _tune_decision_threshold(
+        y_val,
+        val_score,
+        metric=threshold_metric,
+        grid_step=threshold_grid_step,
+    )
+
+    train_metrics = _compute_metrics(y_train, train_score, tuned_threshold)
+    val_metrics = _compute_metrics(y_val, val_score, tuned_threshold)
+
+    wrapped = FeatureSubsetModel(model=model, feature_names=selected_features)
+    params_out = dict(params)
+    params_out["selected_topk_features"] = selected_features
+
+    return ModelResult(
+        name="xgboost_topk",
+        model=wrapped,
+        params=params_out,
+        train_metrics=train_metrics,
+        val_metrics=val_metrics,
+        best_iteration=best_iter,
+        decision_threshold=tuned_threshold,
     )
 
 
@@ -722,6 +1052,7 @@ def save_comparison_table(
         row.update(result.train_metrics.to_dict(prefix="train_"))
         row.update(result.val_metrics.to_dict(prefix="val_"))
         row["best_iteration"] = result.best_iteration
+        row["decision_threshold"] = round(result.decision_threshold, 6)
         row["mlflow_run_id"]  = result.mlflow_run_id or ""
         rows.append(row)
 
@@ -794,6 +1125,12 @@ def run_training(
             "candidate_models",
             default=["logistic_regression", "random_forest", "lightgbm"],
         )
+    )
+    use_optuna_candidate: bool = bool(
+        get_value(config, "modeling", "use_optuna_candidate", default=True)
+    )
+    use_topk_candidate: bool = bool(
+        get_value(config, "modeling", "use_topk_candidate", default=True)
     )
 
     # -------------------------------------------------------------------------
@@ -954,6 +1291,43 @@ def run_training(
         result.mlflow_run_id = _log_to_mlflow(result, experiment_name, tracking_uri)
         all_results.append(result)
 
+    # ---------------------------------------------------------------------
+    # 3b. Advanced official candidates (Optuna + Top-K)
+    # ---------------------------------------------------------------------
+    xgb_base = next((r for r in all_results if r.name == "xgboost"), None)
+
+    if use_optuna_candidate and xgb_base is not None:
+        logger.info("=" * 60)
+        logger.info("STAGE: xgboost_optuna_topk")
+        logger.info("=" * 60)
+        optuna_result = train_xgboost_optuna_candidate(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            config,
+            xgb_base,
+            threshold,
+        )
+        optuna_result.mlflow_run_id = _log_to_mlflow(optuna_result, experiment_name, tracking_uri)
+        all_results.append(optuna_result)
+
+    if use_topk_candidate and xgb_base is not None:
+        logger.info("=" * 60)
+        logger.info("STAGE: xgboost_topk")
+        logger.info("=" * 60)
+        topk_result = train_xgboost_topk_candidate(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            config,
+            xgb_base,
+            threshold,
+        )
+        topk_result.mlflow_run_id = _log_to_mlflow(topk_result, experiment_name, tracking_uri)
+        all_results.append(topk_result)
+
     if not all_results:
         raise ValueError(
             "No models were trained. "
@@ -973,6 +1347,12 @@ def run_training(
     # 5. Persist champion, individual models, and comparison table
     # -------------------------------------------------------------------------
     save_model(champion.model, models_dir / "champion_model.pkl")
+
+    champion_threshold_path = models_dir / str(
+        get_value(config, "artifacts", "champion_threshold_file", default="champion_threshold.txt")
+    )
+    champion_threshold_path.write_text(f"{champion.decision_threshold:.6f}", encoding="utf-8")
+    logger.info("Champion threshold written -> %s  (%.6f)", champion_threshold_path, champion.decision_threshold)
 
     for result in all_results:
         save_model(result.model, models_dir / f"{result.name}.pkl")
