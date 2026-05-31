@@ -15,6 +15,14 @@ paths:
   notebooks_dir: notebooks
   logs_dir: logs
 
+artifacts:
+  champion_model_file: champion_model.pkl
+  champion_name_file: champion_name.txt
+  champion_threshold_file: champion_threshold.txt
+  preprocessor_file: preprocessor.pkl
+  test_evaluation_file: test_evaluation.csv
+  predictions_file: predictions.csv
+
 data_files:
   train: train.csv
   members: members_v3.csv
@@ -54,7 +62,8 @@ data_validation:
     - total_secs
 
 split:
-  validation_size: 0.2
+  validation_size: 0.15
+  test_size: 0.15
   stratify: true
 
 ingestion:
@@ -64,47 +73,94 @@ feature_engineering:
   age_min: 7
   age_max: 70
   recent_days_window: 30
+  cutoff_date: "2017-01-31"
+  output_file: feature_frame.parquet
+  metadata_file: feature_metadata.json
   log_scale_features:
     - total_secs
     - num_unq
     - num_100
     - num_25
 
+eda:
+  preview_rows: 5
+  top_categories: 10
+  correlation_min_abs: 0.05
+  figure_dpi: 150
+
+analysis:
+  top_k_features: 30
+  lift_top_fraction: 0.1
+  shap_sample_size: null
+  shap_chunk_size: 5000
+  shap_beeswarm_sample_size: 5000
+  shap_max_display: 20
+  shap_figure_dpi: 150
+
 modeling:
-  baseline_model: logistic_regression
   candidate_models:
     - logistic_regression
     - random_forest
+    - xgboost
     - lightgbm
+  use_optuna_candidate: true
+  use_topk_candidate: true
   champion_metric: auc_pr
   decision_threshold: 0.5
+  decision_threshold_metric: f2
+  decision_threshold_grid_step: 0.01
 
 logistic_regression:
   solver: lbfgs
+  C: 1.0
   max_iter: 1000
-  class_weight: balanced
 
-random_forest:
-  n_estimators: 300
-  max_depth: null
-  min_samples_split: 2
-  min_samples_leaf: 1
+xgboost:
+  n_estimators: 1000
+  learning_rate: 0.03
+  max_depth: 6
+  subsample: 0.8
+  colsample_bytree: 0.8
+  tree_method: hist
+  eval_metric: aucpr
+  early_stopping_rounds: 100
+  log_eval_period: 100
   n_jobs: -1
 
 lightgbm:
-  n_estimators: 500
-  learning_rate: 0.05
+  metric: auc
+  n_estimators: 1000
+  learning_rate: 0.03
   num_leaves: 31
   max_depth: -1
+  min_child_samples: 50
+  reg_alpha: 0.1
+  reg_lambda: 1.0
   subsample: 0.8
   colsample_bytree: 0.8
-  class_weight: balanced
+  early_stopping_rounds: 100
+  log_eval_period: 100
+
+random_forest:
+  n_estimators: 300
+  max_depth: 15
+  min_samples_split: 2
+  min_samples_leaf: 30
+  n_jobs: -1
+  class_weight: balanced_subsample
 
 optuna:
-  n_trials: 50
+  n_trials: 20
   timeout: null
   direction: maximize
   metric: auc_pr
+  tune_top_k: true
+  top_k_min: 10
+  top_k_max: 100
+  top_k_step: 5
+  verbose_eval: 25
+  early_stopping_rounds: 50
+  num_boost_round: 1000
 
 mlflow:
   experiment_name: kkbox-churn-prediction

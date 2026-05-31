@@ -52,8 +52,29 @@ def _combine_grouped_frames(base: pd.DataFrame | None, chunk: pd.DataFrame, sum_
     return combined
 
 
-def aggregate_transactions(raw_dir: Path, chunksize: int) -> pd.DataFrame:
-    """Aggregate transaction history to one row per user."""
+def aggregate_transactions(
+    raw_dir: Path,
+    chunksize: int,
+    cutoff_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Aggregate transaction history to one row per user.
+
+    Only transactions up to and including ``cutoff_date`` are included.
+    This prevents temporal leakage: non-churners create renewal transactions
+    inside the churn observation window (Feb-Mar 2017). Including those
+    transactions makes ``days_since_last_transaction`` and ``last_expire_date``
+    near-perfect proxies for the churn label.
+
+    Args:
+        raw_dir: Directory containing ``transactions.csv``.
+        chunksize: Number of raw rows to read per chunk.
+        cutoff_date: Inclusive upper bound for ``transaction_date``.
+            Must be set to the day BEFORE the churn observation window opens.
+
+    Returns:
+        User-level transaction aggregate with features computed as of
+        ``cutoff_date``.
+    """
 
     path = raw_dir / "transactions.csv"
     usecols = [
@@ -79,11 +100,24 @@ def aggregate_transactions(raw_dir: Path, chunksize: int) -> pd.DataFrame:
 
     partial_frames: list[pd.DataFrame] = []
     chunk_count = 0
+    rows_dropped_total = 0
     for chunk in _read_chunked_csv(path, chunksize=chunksize, usecols=usecols, dtype=dtype):
         chunk_count += 1
-        logger.info("transactions chunk %s: %s rows", chunk_count, len(chunk))
         chunk["transaction_date"] = pd.to_datetime(chunk["transaction_date"], format="%Y%m%d", errors="coerce")
         chunk["membership_expire_date"] = pd.to_datetime(chunk["membership_expire_date"], format="%Y%m%d", errors="coerce")
+
+        # ── Temporal cutoff ─────────────────────────────────────────────────
+        # Drop rows AFTER the cutoff to prevent leakage. Non-churners who
+        # renew inside the observation window (Feb-Mar 2017) would otherwise
+        # create transactions that make last_transaction_date and
+        # last_expire_date near-perfect churn proxies.
+        before = len(chunk)
+        chunk = chunk[chunk["transaction_date"].notna() & (chunk["transaction_date"] <= cutoff_date)]
+        rows_dropped_total += before - len(chunk)
+        if chunk.empty:
+            continue
+        # ────────────────────────────────────────────────────────────────────
+
         chunk["discount_amount"] = chunk["plan_list_price"] - chunk["actual_amount_paid"]
         chunk["discount_rate"] = _safe_divide(chunk["discount_amount"], chunk["plan_list_price"])
 
@@ -104,6 +138,13 @@ def aggregate_transactions(raw_dir: Path, chunksize: int) -> pd.DataFrame:
             .reset_index()
         )
         partial_frames.append(grouped)
+        logger.info(
+            "transactions chunk %s: %s rows kept (dropped %s after cutoff %s)",
+            chunk_count, len(chunk), before - len(chunk), cutoff_date.date(),
+        )
+    logger.info(
+        "transactions: total rows dropped after cutoff: %s", rows_dropped_total
+    )
     logger.info("transactions aggregation finished after %s chunks", chunk_count)
 
     if not partial_frames:
@@ -134,9 +175,12 @@ def aggregate_transactions(raw_dir: Path, chunksize: int) -> pd.DataFrame:
     aggregated["mean_plan_price"] = _safe_divide(aggregated["plan_list_price_sum"], aggregated["trans_count"])
     aggregated["mean_discount_rate"] = _safe_divide(aggregated["discount_rate_sum"], aggregated["trans_count"])
 
-    reference_date = aggregated["last_transaction_date"].max()
-    if pd.notna(reference_date):
-        aggregated["days_since_last_transaction"] = (reference_date - aggregated["last_transaction_date"]).dt.days
+    # Use the FIXED cutoff_date as reference — not max(data) — so that
+    # days_since_last_transaction is computed from a consistent, leak-free
+    # anchor point regardless of how recently each user last transacted.
+    aggregated["days_since_last_transaction"] = (
+        cutoff_date - aggregated["last_transaction_date"]
+    ).dt.days
 
     output_columns = [
         "msno",
@@ -157,8 +201,24 @@ def aggregate_transactions(raw_dir: Path, chunksize: int) -> pd.DataFrame:
     return aggregated[output_columns]
 
 
-def aggregate_user_logs(raw_dir: Path, chunksize: int) -> pd.DataFrame:
-    """Aggregate listening logs to one row per user."""
+def aggregate_user_logs(
+    raw_dir: Path,
+    chunksize: int,
+    cutoff_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Aggregate listening logs to one row per user.
+
+    Only log rows up to and including ``cutoff_date`` are included.
+    See ``aggregate_transactions`` for the leakage rationale.
+
+    Args:
+        raw_dir: Directory containing ``user_logs.csv``.
+        chunksize: Number of raw rows to read per chunk.
+        cutoff_date: Inclusive upper bound for the ``date`` column.
+
+    Returns:
+        User-level log aggregate with features computed as of ``cutoff_date``.
+    """
 
     path = raw_dir / "user_logs.csv"
     usecols = [
@@ -186,10 +246,19 @@ def aggregate_user_logs(raw_dir: Path, chunksize: int) -> pd.DataFrame:
 
     partial_frames: list[pd.DataFrame] = []
     chunk_count = 0
+    rows_dropped_total = 0
     for chunk in _read_chunked_csv(path, chunksize=chunksize, usecols=usecols, dtype=dtype):
         chunk_count += 1
-        logger.info("user_logs chunk %s: %s rows", chunk_count, len(chunk))
         chunk["date"] = pd.to_datetime(chunk["date"], format="%Y%m%d", errors="coerce")
+
+        # ── Temporal cutoff ─────────────────────────────────────────────────
+        before = len(chunk)
+        chunk = chunk[chunk["date"].notna() & (chunk["date"] <= cutoff_date)]
+        rows_dropped_total += before - len(chunk)
+        if chunk.empty:
+            continue
+        # ────────────────────────────────────────────────────────────────────
+
         chunk["row_completion_rate"] = _safe_divide(
             chunk["num_100"],
             chunk[["num_25", "num_50", "num_75", "num_985", "num_100"]].sum(axis=1),
@@ -211,6 +280,13 @@ def aggregate_user_logs(raw_dir: Path, chunksize: int) -> pd.DataFrame:
             .reset_index()
         )
         partial_frames.append(grouped)
+        logger.info(
+            "user_logs chunk %s: %s rows kept (dropped %s after cutoff %s)",
+            chunk_count, len(chunk), before - len(chunk), cutoff_date.date(),
+        )
+    logger.info(
+        "user_logs: total rows dropped after cutoff: %s", rows_dropped_total
+    )
     logger.info("user_logs aggregation finished after %s chunks", chunk_count)
 
     if not partial_frames:
@@ -248,9 +324,10 @@ def aggregate_user_logs(raw_dir: Path, chunksize: int) -> pd.DataFrame:
     )
     aggregated["mean_completion_rate"] = _safe_divide(aggregated["completion_rate_sum"], aggregated["active_days"])
 
-    reference_date = aggregated["last_log_date"].max()
-    if pd.notna(reference_date):
-        aggregated["days_since_last_log"] = (reference_date - aggregated["last_log_date"]).dt.days
+    # Fixed reference anchor — same logic as aggregate_transactions.
+    aggregated["days_since_last_log"] = (
+        cutoff_date - aggregated["last_log_date"]
+    ).dt.days
 
     output_columns = [
         "msno",
@@ -288,14 +365,16 @@ def main() -> None:
     interim_dir.mkdir(parents=True, exist_ok=True)
 
     chunksize = int(config["ingestion"]["chunksize"])
+    cutoff_date = pd.Timestamp(config["feature_engineering"]["cutoff_date"])
+    logger.info("Temporal cutoff date: %s", cutoff_date.date())
 
     logger.info("Loading compact tables from raw data")
     train = load_train(raw_dir)
     logger.info("train loaded: %s rows x %s columns", train.shape[0], train.shape[1])
     members = load_members(raw_dir)
     logger.info("members loaded: %s rows x %s columns", members.shape[0], members.shape[1])
-    transactions = aggregate_transactions(raw_dir, chunksize)
-    user_logs = aggregate_user_logs(raw_dir, chunksize)
+    transactions = aggregate_transactions(raw_dir, chunksize, cutoff_date)
+    user_logs = aggregate_user_logs(raw_dir, chunksize, cutoff_date)
 
     logger.info("Building modeling frame")
     modeling_frame = build_modeling_frame(train, members, transactions, user_logs)
@@ -315,3 +394,17 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    config_path = PROJECT_ROOT / "config" / "config.yaml"
+    config = load_config(config_path)
+    interim_dir = get_path(config, "interim_dir")
+    if not interim_dir.is_absolute():
+        interim_dir = PROJECT_ROOT / interim_dir
+    print("Ingestion outputs written to:", interim_dir)
+    for name in [
+        "train.parquet",
+        "members.parquet",
+        "transactions_summary.parquet",
+        "user_logs_summary.parquet",
+        "modeling_frame.parquet",
+    ]:
+        print(" -", interim_dir / name)
