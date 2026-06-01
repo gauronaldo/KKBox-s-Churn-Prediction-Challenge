@@ -67,13 +67,28 @@ split:
   stratify: true
 
 ingestion:
-  chunksize: 500000
+  backend: duckdb
+  chunksize: 200000
+  duckdb_threads: 2
+  duckdb_memory_limit: 4GB
+  duckdb_max_temp_directory_size: 50GB
+  duckdb_preserve_insertion_order: false
+  duckdb_temp_dir: data/interim/duckdb_tmp
 
 feature_engineering:
   age_min: 7
   age_max: 70
   recent_days_window: 30
   cutoff_date: "2017-01-31"
+  recency_decay_windows:
+    - 7
+    - 14
+    - 30
+    - 90
+  behavior_windows:
+    - 7
+    - 14
+    - 30
   output_file: feature_frame.parquet
   metadata_file: feature_metadata.json
   log_scale_features:
@@ -96,6 +111,11 @@ analysis:
   shap_beeswarm_sample_size: 5000
   shap_max_display: 20
   shap_figure_dpi: 150
+  auto_renew_ablation_report_file: auto_renew_ablation.csv
+  auto_renew_ablation_feature_patterns:
+    - auto_renew
+    - cancel_rate
+    - retention_rate_from_transactions
 
 modeling:
   candidate_models:

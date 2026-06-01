@@ -1,0 +1,3 @@
+experiment,split,rows,features_before,features_after,features_dropped,dropped_columns,threshold,best_iteration,auc_roc,auc_pr,f1,precision,recall,lift_at_top_fraction
+xgboost_auto_renew_ablation,train,695051,125,121,4,auto_renew_rate|cancel_rate|no_auto_renew_recent_usage|retention_rate_from_transactions,0.61,999,0.9118481371989503,0.5323704295225772,0.45693663093089903,0.33323700018578534,0.7266875239145603,6.36004426267284
+xgboost_auto_renew_ablation,val,148940,125,121,4,auto_renew_rate|cancel_rate|no_auto_renew_recent_usage|retention_rate_from_transactions,0.61,999,0.8689764847552758,0.46436050731515477,0.41398721811980527,0.3023019634394042,0.656548681861149,5.805062493435563
