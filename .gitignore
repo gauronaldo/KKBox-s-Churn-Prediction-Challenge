@@ -209,6 +209,7 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+notebooks/debug_pipeline.ipynb
 # Marimo
 marimo/_static/
 marimo/_lsp/
@@ -217,8 +218,14 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Data
-/data/
+# Project data
+data/raw/
+data/interim/
+data/processed/
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
 
 # Python
 venv/
@@ -240,9 +247,16 @@ logs/
 
 # Output artifacts
 output/
+reports/figures/
 
 # Local archive of experiments and cleanup snapshots
 archive/
 
-# Oversized model artifact that exceeds GitHub's single-file limit
-models/random_forest.pkl
+# Model artifacts
+models/*.pkl
+models/*.joblib
+
+# Local database and large-data temp files
+*.duckdb
+*.duckdb.wal
+data/interim/duckdb_tmp/
