@@ -69,9 +69,10 @@ def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
         denominator: The divisor series.
 
     Returns:
-        Element-wise quotient; zero denominators yield ``pd.NA``.
+        Element-wise quotient; zero denominators yield ``np.nan``.
     """
-    denominator = denominator.replace(0, pd.NA)
+    numerator = pd.to_numeric(numerator, errors="coerce")
+    denominator = pd.to_numeric(denominator, errors="coerce").replace(0, np.nan)
     return numerator / denominator
 
 
@@ -320,6 +321,15 @@ def engineer_features(
             config, "feature_engineering", "log_scale_features", default=[]
         )
     )
+    recency_decay_windows: list[int] = [
+        int(window)
+        for window in get_value(
+            config,
+            "feature_engineering",
+            "recency_decay_windows",
+            default=[recent_days_window],
+        )
+    ]
     # Read cutoff from config.  This MUST match the cutoff applied during
     # ingestion (run_ingestion.py) so that all days_since_* features and
     # member_age_days use an identical, leak-free anchor point.
@@ -497,6 +507,81 @@ def engineer_features(
         )
         logger.debug("Computed 'events_per_active_day'.")
 
+    if {"total_secs_7d", "total_secs_30d"}.issubset(df.columns):
+        df["secs_7d_vs_30d_ratio"] = _safe_divide(
+            df["total_secs_7d"],
+            df["total_secs_30d"],
+        )
+    if {"active_days_7d", "active_days_30d"}.issubset(df.columns):
+        df["active_days_7d_vs_30d_ratio"] = _safe_divide(
+            df["active_days_7d"],
+            df["active_days_30d"],
+        )
+    if {"total_secs_14d", "total_secs_30d"}.issubset(df.columns):
+        df["secs_14d_vs_30d_ratio"] = _safe_divide(
+            df["total_secs_14d"],
+            df["total_secs_30d"],
+        )
+    if {"active_days_14d", "active_days_30d"}.issubset(df.columns):
+        df["active_days_14d_vs_30d_ratio"] = _safe_divide(
+            df["active_days_14d"],
+            df["active_days_30d"],
+        )
+    if {"total_unq_7d", "total_unq_30d"}.issubset(df.columns):
+        df["unq_7d_vs_30d_ratio"] = _safe_divide(
+            df["total_unq_7d"],
+            df["total_unq_30d"],
+        )
+    if {"total_unq_14d", "total_unq_30d"}.issubset(df.columns):
+        df["unq_14d_vs_30d_ratio"] = _safe_divide(
+            df["total_unq_14d"],
+            df["total_unq_30d"],
+        )
+    if {"total_secs_7d", "total_secs_30d"}.issubset(df.columns):
+        prior_secs_23d = (df["total_secs_30d"] - df["total_secs_7d"]).clip(lower=0)
+        # Momentum compares current-week listening with the prior 23 days,
+        # giving the model a non-renewal signal for accelerating disengagement.
+        df["secs_7d_vs_prior_23d_ratio"] = _safe_divide(df["total_secs_7d"], prior_secs_23d)
+        df["secs_prior_23d"] = prior_secs_23d
+    if {"active_days_7d", "active_days_30d"}.issubset(df.columns):
+        prior_active_days_23d = (df["active_days_30d"] - df["active_days_7d"]).clip(lower=0)
+        df["active_days_7d_vs_prior_23d_ratio"] = _safe_divide(
+            df["active_days_7d"],
+            prior_active_days_23d,
+        )
+        df["active_days_prior_23d"] = prior_active_days_23d
+    if {"total_unq_7d", "total_unq_30d"}.issubset(df.columns):
+        prior_unq_23d = (df["total_unq_30d"] - df["total_unq_7d"]).clip(lower=0)
+        df["unq_7d_vs_prior_23d_ratio"] = _safe_divide(df["total_unq_7d"], prior_unq_23d)
+        df["unq_prior_23d"] = prior_unq_23d
+    if {"completion_rate_7d", "completion_rate_30d"}.issubset(df.columns):
+        # Negative deltas indicate recent completion quality is deteriorating.
+        df["completion_rate_delta_7d_30d"] = (
+            df["completion_rate_7d"] - df["completion_rate_30d"]
+        )
+    if {"skip_rate_7d", "skip_rate_30d"}.issubset(df.columns):
+        df["skip_rate_delta_7d_30d"] = (
+            df["skip_rate_7d"] - df["skip_rate_30d"]
+        )
+    if {"completion_rate_14d", "completion_rate_30d"}.issubset(df.columns):
+        df["completion_rate_delta_14d_30d"] = (
+            df["completion_rate_14d"] - df["completion_rate_30d"]
+        )
+    if {"skip_rate_14d", "skip_rate_30d"}.issubset(df.columns):
+        df["skip_rate_delta_14d_30d"] = (
+            df["skip_rate_14d"] - df["skip_rate_30d"]
+        )
+    if {"total_secs_7d", "active_days_30d"}.issubset(df.columns):
+        df["recent_listening_intensity"] = _safe_divide(
+            df["total_secs_7d"],
+            df["active_days_30d"],
+        )
+    if {"total_secs_14d", "active_days_30d"}.issubset(df.columns):
+        df["midterm_listening_intensity"] = _safe_divide(
+            df["total_secs_14d"],
+            df["active_days_30d"],
+        )
+
     # -------------------------------------------------------------------------
     # 6. Cross-source ratio features
     # -------------------------------------------------------------------------
@@ -543,9 +628,7 @@ def engineer_features(
     # ---------------------------------------------------------------------
     # Additional recency windows and simple trend/ratio features
     # ---------------------------------------------------------------------
-    # Add binary flags for multiple short-term windows (7,14,30,90 days).
-    multi_windows = [7, 14, 30, 90]
-    for w in multi_windows:
+    for w in recency_decay_windows:
         col_name_tx = f"recent_transaction_{w}d"
         col_name_log = f"recent_usage_{w}d"
         if "days_since_last_transaction" in df.columns:
@@ -557,7 +640,7 @@ def engineer_features(
     # we approximate short-term activity via exponential decay of aggregate
     # totals using the recency days as a timescale. These are not exact
     # counts but provide graded recency-weighted activity signals.
-    for w in multi_windows:
+    for w in recency_decay_windows:
         if "trans_count" in df.columns and "days_since_last_transaction" in df.columns:
             df[f"trans_count_decay_{w}d"] = (
                 df["trans_count"].fillna(0) * np.exp(-df["days_since_last_transaction"].fillna(9999) / float(w))
@@ -570,6 +653,31 @@ def engineer_features(
             df[f"listen_decay_{w}d"] = (
                 df["listen_events_total"].fillna(0) * np.exp(-df["days_since_last_log"].fillna(9999) / float(w))
             )
+
+    if {"days_since_last_log", "total_secs"}.issubset(df.columns):
+        # Recency-weighted listening lets behavior compete with renewal flags:
+        # recent high usage is a direct signal of product value.
+        df["recency_weighted_total_secs"] = (
+            _log1p_safe(pd.to_numeric(df["total_secs"], errors="coerce").fillna(0))
+            * np.exp(-df["days_since_last_log"].fillna(9999) / float(recent_days_window))
+        )
+    if {"days_since_last_log", "listen_events_total"}.issubset(df.columns):
+        df["recency_weighted_listen_events"] = (
+            _log1p_safe(pd.to_numeric(df["listen_events_total"], errors="coerce").fillna(0))
+            * np.exp(-df["days_since_last_log"].fillna(9999) / float(recent_days_window))
+        )
+    if {"days_since_last_transaction", "total_spend"}.issubset(df.columns):
+        # Recent spend has different meaning than lifetime spend for retention
+        # prioritization, especially when auto-renew is unavailable.
+        df["recency_weighted_total_spend"] = (
+            _log1p_safe(pd.to_numeric(df["total_spend"], errors="coerce").fillna(0))
+            * np.exp(-df["days_since_last_transaction"].fillna(9999) / float(recent_days_window))
+        )
+    if {"recency_weighted_total_secs", "recency_weighted_total_spend"}.issubset(df.columns):
+        df["recency_weighted_usage_to_spend"] = _safe_divide(
+            df["recency_weighted_total_secs"],
+            df["recency_weighted_total_spend"],
+        )
 
     # Simple ratio features that are robust to zero/NA via _safe_divide.
     if {"total_spend", "active_days"}.issubset(df.columns):
@@ -590,6 +698,20 @@ def engineer_features(
     if "retention_rate_from_transactions" in df.columns and "profile_completeness" in df.columns:
         df["retention_profile_interaction"] = (
             df["retention_rate_from_transactions"].fillna(0) * df["profile_completeness"].fillna(0)
+        )
+
+    if {"auto_renew_rate", "recent_listening_intensity"}.issubset(df.columns):
+        # High recent usage without auto-renew is a high-value retention segment.
+        df["no_auto_renew_recent_usage"] = (
+            (1 - df["auto_renew_rate"].fillna(0))
+            * df["recent_listening_intensity"].fillna(0)
+        )
+
+    if {"mean_plan_price", "secs_per_active_day_30d"}.issubset(df.columns):
+        # Expensive plans with shallow recent listening can signal weak perceived value.
+        df["price_per_recent_listening_depth"] = _safe_divide(
+            df["mean_plan_price"],
+            df["secs_per_active_day_30d"],
         )
 
     # Robust z-score for secs_per_active_day as a trend/proxy signal. Use

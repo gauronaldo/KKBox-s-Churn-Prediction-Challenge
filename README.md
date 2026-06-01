@@ -1,178 +1,248 @@
 # KKBox Churn Prediction
 
 ![Python](https://img.shields.io/badge/python-3.11-blue.svg)
-![scikit-learn](https://img.shields.io/badge/scikit--learn-1.8.0-orange.svg)
-![XGBoost](https://img.shields.io/badge/XGBoost-3.2.0-brightgreen.svg)
-![LightGBM](https://img.shields.io/badge/LightGBM-4.6.0-green.svg)
-![Optuna](https://img.shields.io/badge/Optuna-4.9.0-purple.svg)
-![MLflow](https://img.shields.io/badge/MLflow-3.12.0-blueviolet.svg)
-![Pytest](https://img.shields.io/badge/testing-pytest-blue.svg)
-![Ruff](https://img.shields.io/badge/linting-ruff-000000.svg)
+![DuckDB](https://img.shields.io/badge/DuckDB-large--data-yellow.svg)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-1.8-orange.svg)
+![XGBoost](https://img.shields.io/badge/XGBoost-3.2-green.svg)
+![LightGBM](https://img.shields.io/badge/LightGBM-4.6-green.svg)
+![MLflow](https://img.shields.io/badge/MLflow-tracking-blueviolet.svg)
+![FastAPI](https://img.shields.io/badge/FastAPI-serving-teal.svg)
+![Pytest](https://img.shields.io/badge/tests-pytest-blue.svg)
 
-Churn prediction pipeline for the WSDM 2018 KKBox challenge.
+Production-style machine learning pipeline for the KKBox Music Streaming Churn Prediction problem. The goal is to identify subscribers likely to churn so the business can prioritize retention campaigns before revenue is lost.
 
-This repository is organized as a reproducible machine learning project. Raw data ingestion, feature engineering, preprocessing, model training, evaluation, and interpretation are all driven by code and persisted artifacts instead of notebook state.
+## Highlights
 
-## Project Overview
+- End-to-end reproducible pipeline: ingestion, validation, feature engineering, preprocessing, training, evaluation, interpretation, and scoring.
+- Large-data ingestion with DuckDB for the 30GB `user_logs.csv` file.
+- Snapshot-safe feature generation using a fixed cutoff date to reduce temporal leakage.
+- Multiple model families: Logistic Regression, Random Forest, XGBoost, LightGBM, and Optuna-tuned XGBoost.
+- MLflow experiment tracking for model parameters, metrics, and artifacts.
+- Champion model persisted with threshold and evaluation reports.
+- FastAPI scoring app for quick demo predictions from engineered feature CSV/JSON.
 
-The objective is to predict whether a KKBox subscriber will churn after membership expiry using transaction history, listening logs, and member demographics.
+## Business Problem
 
-The pipeline is designed to:
+KKBox wants to predict whether a subscriber will fail to renew. A useful model should rank high-risk users well enough for targeted intervention, not just optimize raw accuracy on an imbalanced dataset.
 
-- build a snapshot-safe modeling frame using a fixed cutoff date,
-- engineer user-level behavioral and demographic features,
-- train baseline and advanced candidates,
-- select a champion by validation AUC-PR,
-- evaluate the champion on a held-out test split,
-- generate feature importance and SHAP interpretation artifacts,
-- keep the repo reproducible and audit-friendly.
+Primary modeling metric: **AUC-PR**, because churn is the minority class and precision-recall behavior matters more than ROC alone for campaign targeting.
 
-## Repository Structure
+## Current Results
+
+Active champion: `xgboost_optuna_topk`
+
+Held-out test performance:
+
+| Metric | Value |
+|---|---:|
+| AUC-ROC | 0.8909 |
+| AUC-PR | 0.5251 |
+| F1 | 0.4504 |
+| Precision | 0.3242 |
+| Recall | 0.7375 |
+| Lift at top 10% | 6.42x |
+| Decision threshold | 0.10 |
+
+Validation comparison:
+
+| Model | Val AUC-PR | Val Recall | Val Precision | Threshold |
+|---|---:|---:|---:|---:|
+| xgboost_optuna_topk | 0.5229 | 0.7246 | 0.3220 | 0.10 |
+| xgboost_topk | 0.5048 | 0.6945 | 0.3432 | 0.65 |
+| lightgbm | 0.5048 | 0.6903 | 0.3482 | 0.66 |
+| xgboost | 0.5031 | 0.6937 | 0.3444 | 0.64 |
+| random_forest | 0.4886 | 0.7041 | 0.3213 | 0.50 |
+| logistic_regression | 0.4113 | 0.6899 | 0.2779 | 0.08 |
+
+Reports are stored in `reports/model_comparison.csv`, `reports/test_evaluation.csv`, `reports/feature_importances.csv`, and SHAP outputs under `reports/`.
+
+## Architecture
+
+```text
+data/raw/*.csv
+        |
+        v
+src.data.run_ingestion
+  - DuckDB aggregates transactions and user logs
+  - pandas loads smaller member/label tables
+        |
+        v
+data/interim/*.parquet
+        |
+        v
+src.features.run_engineer
+  - demographic, transaction, listening, recency, ratio, and trend features
+        |
+        v
+src.features.run_preprocessing
+  - stratified train/validation/test split
+  - train-only preprocessing fit
+        |
+        v
+src.models.run_train
+  - candidate training
+  - MLflow logging
+  - champion selection by validation AUC-PR
+        |
+        v
+src.models.evaluate / src.analysis.*
+        |
+        v
+models/ + reports/
+```
+
+## Repository Layout
 
 ```text
 project_churn_prediction/
-|-- config/
-|   `-- config.yaml
+|-- config/config.yaml
 |-- data/
-|   |-- raw/
-|   |-- interim/
-|   `-- processed/
+|   |-- raw/          # local Kaggle CSVs, never modified by code
+|   |-- interim/      # compact aggregated parquet artifacts
+|   `-- processed/    # feature frame and model-ready splits
 |-- logs/
+|-- mlruns/
 |-- models/
 |-- notebooks/
-|   |-- eda.ipynb
-|   |-- debug_pipeline.ipynb
-|   `-- feature_analysis.ipynb
 |-- reports/
 |-- src/
 |   |-- analysis/
 |   |-- data/
 |   |-- features/
 |   |-- models/
-|   `-- utils/
+|   |-- utils/
+|   `-- app.py        # FastAPI demo scoring app
 |-- tests/
 |-- MODEL_CARD.md
 |-- requirements.txt
 `-- README.md
 ```
 
-## Current Status
+## Setup
 
-- Active champion: `xgboost_optuna_topk`
-- Official comparison table: `reports/model_comparison.csv`
-- Held-out evaluation: `reports/test_evaluation.csv`
-- Interpretation outputs: `reports/feature_importances.csv`, `reports/shap_summary.csv`, `reports/shap_beeswarm.png`, `reports/shap_top20.png`
-
-### Model Comparison
-
-| Model | Val AUC-PR | Val Recall | Val Precision | Decision Threshold |
-|---|---:|---:|---:|---:|
-| xgboost_optuna_topk | 0.5142 | 0.7072 | 0.3343 | 0.11 |
-| xgboost_topk | 0.4999 | 0.7105 | 0.3300 | 0.63 |
-| xgboost | 0.4996 | 0.7225 | 0.3190 | 0.59 |
-| lightgbm | 0.4963 | 0.7042 | 0.3339 | 0.64 |
-| random_forest | 0.4813 | 0.6984 | 0.3256 | 0.50 |
-| logistic_regression | 0.3995 | 0.6866 | 0.2750 | 0.08 |
-
-## Installation
-
-### Prerequisites
-
-- Python 3.11
-- Git
-- Optional: a GPU is not required for this churn pipeline
-
-### Setup Environment
-
-```bash
+```powershell
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-If you only want the runtime pipeline, `requirements.txt` is enough. Keep `requirements-dev.txt` installed when you need notebooks, tests, or linting.
-
-## Quick Start
-
-### 1. Prepare Data
-
-Place the raw KKBox CSV files in `data/raw/`:
+Place the KKBox files in `data/raw/`:
 
 - `train.csv`
 - `members_v3.csv`
 - `transactions.csv`
 - `user_logs.csv`
 
-### 2. Run the End-to-End Pipeline
+## Run The Full Pipeline
 
-```bash
+```powershell
 python -m src.data.run_ingestion
+python -m src.data.validate_artifacts
 python -m src.features.run_engineer
 python -m src.features.run_preprocessing
 python -m src.models.run_train
 python -m src.models.evaluate
 python -m src.analysis.feature_importances
 python -m src.analysis.shap_analysis
-```
-
-### 3. Smoke Checks
-
-```bash
-python -m src.data.validate_artifacts
 python -m pytest -q
 ```
 
-## What Each Stage Does
+## Scoring
 
-- `src.data.run_ingestion` reads the raw CSV files in chunks, applies the temporal cutoff, aggregates to user level, and writes compact Parquet artifacts to `data/interim/`.
-- `src.features.run_engineer` builds the leak-safe feature frame and metadata under `data/processed/`.
-- `src.features.run_preprocessing` creates the train/validation/test splits and saves the fitted preprocessor.
-- `src.models.run_train` trains all candidate models, logs to MLflow, writes `reports/model_comparison.csv`, and persists the champion.
-- `src.models.evaluate` loads the champion and writes `reports/test_evaluation.csv`.
-- `src.analysis.feature_importances` and `src.analysis.shap_analysis` generate the interpretation reports in `reports/`.
+Batch scoring from an engineered feature file:
 
-## Notebooks
+```powershell
+python -m src.models.score --input data/processed/feature_frame.parquet --output reports/predictions.csv
+```
 
-- `notebooks/eda.ipynb` documents exploratory analysis and data-quality checks.
-- `notebooks/feature_analysis.ipynb` reviews feature importance and SHAP outputs.
+Run the FastAPI demo app:
 
-All notebooks are stored in valid Jupyter format with notebook-level metadata, so they can be opened directly in VS Code or Jupyter.
+```powershell
+uvicorn src.app:app --reload --host 127.0.0.1 --port 8000
+```
 
-## Generated Outputs
+Open:
 
-Pipeline artifacts are written to the following locations:
+```text
+http://127.0.0.1:8000
+```
 
-- `data/interim/modeling_frame.parquet`
-- `data/processed/feature_frame.parquet`
-- `data/processed/X_train.parquet`, `X_val.parquet`, `X_test.parquet`
-- `data/processed/y_train.parquet`, `y_val.parquet`, `y_test.parquet`
-- `data/processed/feature_metadata.json`
-- `models/preprocessor.pkl`
-- `models/champion_model.pkl`
-- `models/champion_name.txt`
-- `models/champion_threshold.txt`
-- `models/*.pkl` for trained models
-- `reports/model_comparison.csv`
-- `reports/test_evaluation.csv`
-- `reports/feature_importances.csv`
-- `reports/shap_summary.csv`
-- `reports/shap_beeswarm.png`
-- `reports/shap_top20.png`
-- `logs/feature_engineering.log`
-- `logs/training.log`
+The app expects rows with the engineered feature schema, such as columns from `data/processed/feature_frame.parquet`. This is intentional: online scoring should use the same preprocessor and feature contract that the model was trained on.
 
-## Modeling Notes
+API examples:
 
-- Logistic Regression uses a separate OneHot + RobustScaler preprocessing path.
-- Tree-based models use ordinal-encoded splits.
-- XGBoost and LightGBM use early stopping on validation metrics.
-- The champion threshold is tuned on validation data and persisted to `models/champion_threshold.txt`.
-- MLflow logging is enabled for training runs when configured.
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/predict-csv -ContentType "text/csv" -InFile sample_features.csv
+```
 
-## Troubleshooting
+```json
+POST /predict
+{
+  "records": [
+    {
+      "msno": "example_user",
+      "auto_renew_rate": 1.0,
+      "trans_count": 3,
+      "total_spend": 447.0
+    }
+  ]
+}
+```
 
-- If a notebook does not open, verify that the file still has valid `.ipynb` JSON structure and notebook metadata.
-- If training fails, confirm that the raw CSVs exist in `data/raw/` and that `python -m src.data.run_ingestion` completed successfully.
-- If SHAP or Optuna imports fail, confirm that `requirements.txt` and `requirements-dev.txt` are installed in the active environment.
-- If VS Code shows a webview or service worker error, reload the window, restart VS Code, and reopen the notebook tab.
+For JSON scoring, omitted feature columns are handled by the fitted preprocessor/model alignment where possible, but production scoring should send the full engineered schema.
+
+## Interpretability Notes
+
+`auto_renew_rate` is currently the highest SHAP feature for the champion model. That is not automatically a bug:
+
+- Auto-renew is a direct subscription-behavior signal and is expected to be predictive.
+- The ingestion stage filters transactions to `transaction_date <= feature_engineering.cutoff_date`, so future renewal events after the snapshot are excluded.
+- Related features such as `cancel_rate`, `retention_rate_from_transactions`, and `no_auto_renew_recent_usage` also rank highly, which is consistent with subscriber renewal mechanics.
+
+Residual risk: if the competition label definition is tightly coupled to subscription renewal mechanics, transaction-derived renewal features can dominate. The right validation is an ablation experiment: retrain without `auto_renew_rate` and related auto-renew/cancel features, then compare AUC-PR, recall, lift, and SHAP stability.
+
+Run the isolated ablation experiment:
+
+```powershell
+python -m src.analysis.auto_renew_ablation
+```
+
+The experiment writes `reports/auto_renew_ablation.csv` and does not overwrite champion model artifacts.
+
+Latest ablation result:
+
+| Experiment | Val AUC-PR | Val Recall | Val Precision | Lift at top 10% |
+|---|---:|---:|---:|---:|
+| XGBoost baseline | 0.5031 | 0.6937 | 0.3444 | 6.26x |
+| XGBoost without auto-renew/cancel family | 0.4652 | 0.6986 | 0.2714 | 5.79x |
+
+Interpretation: the renewal/cancel feature family is materially useful, but the model still retains meaningful ranking power without it. This suggests `auto_renew_rate` is a strong business signal rather than a single-feature leakage failure.
+
+
+## Configuration
+
+All key thresholds and paths live in `config/config.yaml`.
+
+Important settings:
+
+- `project.random_state`: reproducible split/model seed
+- `feature_engineering.cutoff_date`: leak-safe feature snapshot date
+- `feature_engineering.behavior_windows`: listening recency windows
+- `feature_engineering.recency_decay_windows`: recency-weighted feature windows
+- `ingestion.backend`: `duckdb` or `pandas`
+- `ingestion.duckdb_memory_limit`: DuckDB memory cap
+- `ingestion.duckdb_max_temp_directory_size`: DuckDB spill-space cap
+- `modeling.champion_metric`: model selection metric
+- `modeling.decision_threshold_metric`: threshold tuning objective
+
+## Data Safety
+
+The pipeline never writes to `data/raw/`. Generated outputs are written to:
+
+- `data/interim/`
+- `data/processed/`
+- `models/`
+- `reports/`
+- `logs/`
+
 
