@@ -53,7 +53,6 @@ project_churn_prediction/
 |-- tests/
 |-- MODEL_CARD.md
 |-- requirements.txt
-|-- requirements-dev.txt
 `-- README.md
 ```
 
