@@ -15,10 +15,9 @@ Production-style machine learning pipeline for the KKBox Music Streaming Churn P
 - End-to-end reproducible pipeline: ingestion, validation, feature engineering, preprocessing, training, evaluation, interpretation, and scoring.
 - Large-data ingestion with DuckDB for the 30GB `user_logs.csv` file.
 - Snapshot-safe feature generation using a fixed cutoff date to reduce temporal leakage.
-- Multiple model families: Logistic Regression, Random Forest, XGBoost, LightGBM, and Optuna-tuned XGBoost.
+- Multiple model families: Logistic Regression, Random Forest, XGBoost, LightGBM, plus Optuna + Top-K variants for XGBoost and LightGBM.
 - MLflow experiment tracking for model parameters, metrics, and artifacts.
 - Champion model persisted with threshold and evaluation reports.
-- FastAPI scoring app for quick demo predictions from engineered feature CSV/JSON.
 
 ## Business Problem
 
@@ -69,24 +68,27 @@ Held-out test performance:
 
 | Metric | Value |
 |---|---:|
-| AUC-ROC | 0.8909 |
-| AUC-PR | 0.5251 |
-| F1 | 0.4504 |
-| Precision | 0.3242 |
-| Recall | 0.7375 |
-| Lift at top 10% | 6.42x |
+| AUC-ROC | 0.8900 |
+| AUC-PR | 0.5225 |
+| F1 | 0.4480 |
+| Precision | 0.3222 |
+| Recall | 0.7351 |
+| Lift at top 10% | 6.39x |
 | Decision threshold | 0.10 |
 
 Validation comparison:
 
-| Model | Val AUC-PR | Val Recall | Val Precision | Threshold |
-|---|---:|---:|---:|---:|
-| xgboost_optuna_topk | 0.5229 | 0.7246 | 0.3220 | 0.10 |
-| xgboost_topk | 0.5048 | 0.6945 | 0.3432 | 0.65 |
-| lightgbm | 0.5048 | 0.6903 | 0.3482 | 0.66 |
-| xgboost | 0.5031 | 0.6937 | 0.3444 | 0.64 |
-| random_forest | 0.4886 | 0.7041 | 0.3213 | 0.50 |
-| logistic_regression | 0.4113 | 0.6899 | 0.2779 | 0.08 |
+This table reflects the latest completed training run. Top-K feature count is tuned inside
+the Optuna candidates, so there is no standalone XGBoost Top-K row.
+
+| Model | Val AUC-PR | Val Recall | Val Precision | Val F1 | Threshold |
+|---|---:|---:|---:|---:|---:|
+| xgboost_optuna_topk | 0.5200 | 0.7259 | 0.3212 | 0.4453 | 0.10 |
+| lightgbm_optuna_topk | 0.5126 | 0.7184 | 0.3244 | 0.4470 | 0.59 |
+| lightgbm | 0.5037 | 0.6936 | 0.3453 | 0.4611 | 0.65 |
+| xgboost | 0.5028 | 0.7020 | 0.3356 | 0.4542 | 0.62 |
+| random_forest | 0.4897 | 0.7029 | 0.3214 | 0.4411 | 0.50 |
+| logistic_regression | 0.4203 | 0.6713 | 0.2893 | 0.4044 | 0.09 |
 
 Reports are stored in `reports/model_comparison.csv`, `reports/test_evaluation.csv`, `reports/feature_importances.csv`, and SHAP outputs under `reports/`.
 
@@ -114,7 +116,9 @@ src.features.run_preprocessing
         |
         v
 src.models.run_train
-  - candidate training
+  - baseline model training
+  - XGBoost Optuna + Top-K candidate
+  - LightGBM Optuna + Top-K candidate
   - MLflow logging
   - champion selection by validation AUC-PR
         |
@@ -187,6 +191,19 @@ Batch scoring from an engineered feature file:
 ```powershell
 python -m src.models.score --input data/processed/feature_frame.parquet --output reports/predictions.csv
 ```
+
+## Modeling Design
+
+Training is intentionally split into baseline and advanced candidate phases:
+
+1. Train baselines: Logistic Regression, Random Forest, XGBoost, and LightGBM.
+2. Build an `xgboost_optuna_topk` candidate using XGBoost gain importance to rank features.
+3. Build a `lightgbm_optuna_topk` candidate using LightGBM feature importance to rank features.
+4. Select the champion from all candidates by validation AUC-PR.
+
+Optuna tunes both model hyperparameters and the `top_k` feature count. The `top_k`
+search range is configured in `config/config.yaml` under `optuna.top_k_min`,
+`optuna.top_k_max`, and `optuna.top_k_step`.
 
 ## Interpretability Notes
 

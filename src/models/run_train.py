@@ -8,9 +8,10 @@ This script loads the project configuration, then calls ``run_training``
 which:
   1. Loads OrdinalEncoded splits from ``data/processed/``.
   2. Builds a OneHot linear preprocessor for Logistic Regression.
-  3. Trains all candidate models (LR, RF, XGBoost, LightGBM).
-  4. Selects the champion by validation AUC-PR.
-  5. Saves models to ``models/`` and a comparison CSV to ``reports/``.
+  3. Trains baseline candidates (LR, RF, XGBoost, LightGBM).
+  4. Runs Optuna + Top-K tuning for XGBoost and LightGBM.
+  5. Selects the champion by validation AUC-PR.
+  6. Saves models to ``models/`` and a comparison CSV to ``reports/``.
 
 Prerequisites (run in order):
   1. python src/data/run_ingestion.py
@@ -43,20 +44,26 @@ if __name__ == "__main__":
     setup_logger("src.models.train", log_file=logs_dir / "training.log")
 
     logger = logging.getLogger(__name__)
-    logger.info("=" * 60)
-    logger.info("Training stage started")
-    logger.info("Project root : %s", PROJECT_ROOT)
-    logger.info("Config       : %s", config_path)
-    logger.info("=" * 60)
+    logger.info(
+        "Training stage started | project_root=%s | config=%s",
+        PROJECT_ROOT,
+        config_path,
+    )
 
-    champion, all_results, comparison_df = run_training(config, PROJECT_ROOT)
+    champion, _all_results, _comparison_df = run_training(config, PROJECT_ROOT)
 
-    logger.info("Champion model : %s", champion.name)
-    logger.info("Val AUC-PR     : %.4f", champion.val_metrics.auc_pr)
-    logger.info("Val AUC-ROC    : %.4f", champion.val_metrics.auc_roc)
-    print("Training outputs written to:")
-    print(" -", PROJECT_ROOT / "models" / "champion_model.pkl")
-    print(" -", PROJECT_ROOT / "models" / "champion_name.txt")
-    print(" -", PROJECT_ROOT / "reports" / "model_comparison.csv")
-    for result in all_results:
-      print(" -", PROJECT_ROOT / "models" / f"{result.name}.pkl")
+    logger.info(
+        "Champion selected | model=%s | val_auc_pr=%.4f | val_auc_roc=%.4f",
+        champion.name,
+        champion.val_metrics.auc_pr,
+        champion.val_metrics.auc_roc,
+    )
+    print("Training complete")
+    print(
+        "Champion:",
+        champion.name,
+        f"| val_auc_pr={champion.val_metrics.auc_pr:.4f}",
+        f"| threshold={champion.decision_threshold:.4f}",
+    )
+    print("Reports:", PROJECT_ROOT / "reports" / "model_comparison.csv")
+    print("Models :", PROJECT_ROOT / "models")

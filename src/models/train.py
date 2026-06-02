@@ -9,9 +9,9 @@ Workflow
    - Random Forest        (OrdinalEncoded, tree-native)
    - XGBoost              (OrdinalEncoded, scale_pos_weight)
    - LightGBM             (OrdinalEncoded, scale_pos_weight)
-4. Train advanced XGBoost candidates as official contenders:
-    - Optuna-tuned XGBoost
-    - Top-K-features XGBoost (based on baseline XGB gain ranking)
+4. Train advanced contenders:
+    - Optuna + Top-K XGBoost (based on baseline XGB gain ranking)
+    - Optuna + Top-K LightGBM (based on baseline LightGBM importance)
 5. Select the champion by highest validation AUC-PR across all contenders.
 6. Persist the champion model and a full comparison table.
 
@@ -66,7 +66,7 @@ from src.features.preprocess import (
 )
 from src.models.booster_model import BoosterModel
 from src.models.feature_subset_model import FeatureSubsetModel
-from src.utils.config import get_value
+from src.utils.config import get_path, get_value
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +77,53 @@ __all__ = [
     "train_random_forest",
     "train_xgboost",
     "train_lightgbm",
+    "train_lightgbm_optuna_topk_candidate",
     "select_champion",
     "save_model",
     "load_model",
     "save_comparison_table",
     "run_training",
 ]
+
+
+def _xgboost_verbose(period: int) -> int | bool:
+    """Return XGBoost verbose setting from a configured eval period."""
+
+    return False if period <= 0 else period
+
+
+def _lightgbm_callbacks(early_stopping_rounds: int, log_eval_period: int) -> list[Any]:
+    """Build LightGBM callbacks while allowing terminal eval logs to be disabled."""
+
+    callbacks: list[Any] = [
+        lgb.early_stopping(
+            stopping_rounds=early_stopping_rounds,
+            verbose=False,
+        )
+    ]
+    if log_eval_period > 0:
+        callbacks.append(lgb.log_evaluation(period=log_eval_period))
+    return callbacks
+
+
+def _set_optuna_verbosity(config: Mapping[str, Any]) -> None:
+    """Set Optuna logging verbosity from config."""
+
+    level_name = str(get_value(config, "optuna", "log_level", default="warning")).lower()
+    levels = {
+        "debug": optuna.logging.DEBUG,
+        "info": optuna.logging.INFO,
+        "warning": optuna.logging.WARNING,
+        "error": optuna.logging.ERROR,
+        "critical": optuna.logging.CRITICAL,
+    }
+    optuna.logging.set_verbosity(levels.get(level_name, optuna.logging.WARNING))
+
+
+def _log_stage(stage_name: str) -> None:
+    """Log a concise stage progress line."""
+
+    logger.info("STAGE: %s", stage_name)
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +581,7 @@ def train_xgboost(
         X_train,
         y_train,
         eval_set=[(X_val, y_val)],
-        verbose=log_eval_period,
+        verbose=_xgboost_verbose(log_eval_period),
     )
 
     best_iter = int(model.best_iteration) if hasattr(model, "best_iteration") else params["n_estimators"]
@@ -648,13 +689,7 @@ def train_lightgbm(
         # in the constructor via params["metric"].  Passing it again in fit()
         # would add a SECOND metric (causing early_stopping to monitor both
         # binary_logloss and our metric, and stop on whichever degrades first).
-        callbacks=[
-            lgb.early_stopping(
-                stopping_rounds=early_stopping_rounds,
-                verbose=False,
-            ),
-            lgb.log_evaluation(period=log_eval_period),
-        ],
+        callbacks=_lightgbm_callbacks(early_stopping_rounds, log_eval_period),
     )
 
     best_iter = int(model.best_iteration_) if model.best_iteration_ else params["n_estimators"]
@@ -710,6 +745,7 @@ def train_xgboost_optuna_candidate(
     num_boost_round = int(get_value(config, "optuna", "num_boost_round", default=1000))
     early_stopping = int(get_value(config, "optuna", "early_stopping_rounds", default=50))
     verbose_eval = int(get_value(config, "optuna", "verbose_eval", default=25))
+    show_progress_bar = bool(get_value(config, "optuna", "show_progress_bar", default=False))
     direction = str(get_value(config, "optuna", "direction", default="maximize"))
     eval_metric = str(get_value(config, "xgboost", "eval_metric", default="aucpr"))
     tune_top_k = bool(get_value(config, "optuna", "tune_top_k", default=True))
@@ -771,7 +807,7 @@ def train_xgboost_optuna_candidate(
             num_boost_round=num_boost_round,
             evals=[(dval, "valid")],
             early_stopping_rounds=early_stopping,
-            verbose_eval=verbose_eval,
+            verbose_eval=_xgboost_verbose(verbose_eval),
         )
         trial.set_user_attr("best_iteration", int(booster.best_iteration))
         trial.set_user_attr("best_ntree_limit", int(booster.best_iteration) + 1)
@@ -780,7 +816,12 @@ def train_xgboost_optuna_candidate(
 
     logger.info("Training Optuna XGBoost candidate | n_trials=%d", n_trials)
     study = optuna.create_study(direction=direction)
-    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        timeout=timeout,
+        show_progress_bar=show_progress_bar,
+    )
 
     best = study.best_params
     best_trial = study.best_trial
@@ -814,7 +855,7 @@ def train_xgboost_optuna_candidate(
         dtrain_final,
         num_boost_round=best_ntree_limit,
         evals=[(dval_final, "valid")],
-        verbose_eval=verbose_eval,
+        verbose_eval=_xgboost_verbose(verbose_eval),
     )
 
     train_score = final_booster.predict(dtrain_final)
@@ -853,63 +894,138 @@ def train_xgboost_optuna_candidate(
     )
 
 
-def train_xgboost_topk_candidate(
+def _rank_lightgbm_features(
+    model: lgb.LGBMClassifier,
+    feature_names: list[str],
+) -> list[str]:
+    """Rank features by fitted LightGBM split/gain importance."""
+
+    importances = getattr(model, "feature_importances_", None)
+    if importances is None or len(importances) != len(feature_names):
+        return feature_names
+
+    ranked = [
+        feature
+        for feature, importance in sorted(
+            zip(feature_names, importances),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )
+        if importance > 0
+    ]
+    return ranked or feature_names
+
+
+def train_lightgbm_optuna_topk_candidate(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_val: pd.DataFrame,
     y_val: pd.Series,
     config: Mapping[str, Any],
-    base_xgb_result: ModelResult,
+    base_lgb_result: ModelResult,
     threshold: float = 0.5,
 ) -> ModelResult:
-    """Train a top-K-features XGBoost candidate for champion selection."""
+    """Train an Optuna-tuned LightGBM candidate with LightGBM-ranked top-K features."""
 
-    top_k = int(get_value(config, "analysis", "top_k_features", default=30))
-    booster = base_xgb_result.model.get_booster()
-    gain_map = booster.get_score(importance_type="gain")
-    if not gain_map:
-        raise ValueError("Top-K candidate requires XGBoost gain importances, but none were found.")
+    random_state = int(get_value(config, "project", "random_state", default=42))
+    n_trials = int(get_value(config, "optuna", "n_trials", default=50))
+    timeout = get_value(config, "optuna", "timeout", default=None)
+    num_boost_round = int(get_value(config, "optuna", "num_boost_round", default=1000))
+    early_stopping = int(get_value(config, "optuna", "early_stopping_rounds", default=50))
+    verbose_eval = int(get_value(config, "optuna", "verbose_eval", default=25))
+    show_progress_bar = bool(get_value(config, "optuna", "show_progress_bar", default=False))
+    direction = str(get_value(config, "optuna", "direction", default="maximize"))
+    tune_top_k = bool(get_value(config, "optuna", "tune_top_k", default=True))
+    top_k_min = int(get_value(config, "optuna", "top_k_min", default=10))
+    top_k_max = int(get_value(config, "optuna", "top_k_max", default=100))
+    top_k_step = int(get_value(config, "optuna", "top_k_step", default=5))
+    metric = str(get_value(config, "lightgbm", "metric", default="auc"))
 
-    ranked_features = [
-        feat
-        for feat, _ in sorted(gain_map.items(), key=lambda kv: kv[1], reverse=True)
-        if feat in X_train.columns
-    ]
-    selected_features = ranked_features[:top_k]
-    if not selected_features:
-        raise ValueError("Top-K candidate found no overlapping features in training matrix.")
+    ranked_features = _rank_lightgbm_features(base_lgb_result.model, list(X_train.columns))
+    k_min = max(1, min(top_k_min, len(ranked_features)))
+    k_max = max(k_min, min(top_k_max, len(ranked_features)))
 
-    logger.info("Training top-K XGBoost candidate | top_k=%d | selected=%d", top_k, len(selected_features))
-    X_train_topk = X_train[selected_features]
-    X_val_topk = X_val[selected_features]
+    scale_pos_weight = _scale_pos_weight(y_train)
+    y_train_arr = np.asarray(y_train).ravel()
+    y_val_arr = np.asarray(y_val).ravel()
 
-    params = {
-        "n_estimators": int(get_value(config, "xgboost", "n_estimators", default=1000)),
-        "learning_rate": float(get_value(config, "xgboost", "learning_rate", default=0.05)),
-        "max_depth": int(get_value(config, "xgboost", "max_depth", default=6)),
-        "subsample": float(get_value(config, "xgboost", "subsample", default=0.8)),
-        "colsample_bytree": float(get_value(config, "xgboost", "colsample_bytree", default=0.8)),
-        "tree_method": str(get_value(config, "xgboost", "tree_method", default="hist")),
-        "eval_metric": str(get_value(config, "xgboost", "eval_metric", default="aucpr")),
-        "early_stopping_rounds": int(get_value(config, "xgboost", "early_stopping_rounds", default=100)),
-        "scale_pos_weight": _scale_pos_weight(y_train),
-        "random_state": int(get_value(config, "project", "random_state", default=42)),
-        "n_jobs": -1,
-        "verbosity": 0,
-    }
-    log_eval_period = int(get_value(config, "xgboost", "log_eval_period", default=100))
+    def objective(trial: optuna.Trial) -> float:
+        if tune_top_k:
+            top_k = trial.suggest_int("top_k", k_min, k_max, step=top_k_step)
+        else:
+            top_k = len(ranked_features)
+        selected = ranked_features[:top_k]
 
-    model = xgb.XGBClassifier(**params)
-    model.fit(
-        X_train_topk,
-        y_train,
-        eval_set=[(X_val_topk, y_val)],
-        verbose=log_eval_period,
+        params = {
+            "n_estimators": num_boost_round,
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 256, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "min_child_samples": trial.suggest_int("min_child_samples", 20, 200),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "scale_pos_weight": scale_pos_weight,
+            "metric": metric,
+            "random_state": random_state,
+            "n_jobs": int(get_value(config, "lightgbm", "n_jobs", default=-1)),
+            "verbose": -1,
+        }
+
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            X_train[selected],
+            y_train_arr,
+            eval_set=[(X_val[selected], y_val_arr)],
+            callbacks=_lightgbm_callbacks(early_stopping, verbose_eval),
+        )
+        val_score = model.predict_proba(X_val[selected])[:, 1]
+        trial.set_user_attr("best_iteration", int(model.best_iteration_ or num_boost_round))
+        trial.set_user_attr("top_k", int(top_k))
+        return float(average_precision_score(y_val_arr, val_score))
+
+    logger.info("Training Optuna LightGBM candidate | n_trials=%d", n_trials)
+    study = optuna.create_study(direction=direction)
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        timeout=timeout,
+        show_progress_bar=show_progress_bar,
     )
 
-    best_iter = int(model.best_iteration) if hasattr(model, "best_iteration") else int(params["n_estimators"])
-    train_score = model.predict_proba(X_train_topk)[:, 1]
-    val_score = model.predict_proba(X_val_topk)[:, 1]
+    best = study.best_params
+    best_trial = study.best_trial
+    best_iteration = int(best_trial.user_attrs.get("best_iteration", num_boost_round))
+    best_top_k = int(best_trial.user_attrs.get("top_k", len(ranked_features)))
+    selected_features = ranked_features[:best_top_k]
+
+    final_params = {
+        "n_estimators": num_boost_round,
+        "learning_rate": float(best["learning_rate"]),
+        "num_leaves": int(best["num_leaves"]),
+        "max_depth": int(best["max_depth"]),
+        "min_child_samples": int(best["min_child_samples"]),
+        "reg_alpha": float(best["reg_alpha"]),
+        "reg_lambda": float(best["reg_lambda"]),
+        "subsample": float(best["subsample"]),
+        "colsample_bytree": float(best["colsample_bytree"]),
+        "scale_pos_weight": scale_pos_weight,
+        "metric": metric,
+        "random_state": random_state,
+        "n_jobs": int(get_value(config, "lightgbm", "n_jobs", default=-1)),
+        "verbose": -1,
+    }
+    final_model = lgb.LGBMClassifier(**final_params)
+    final_model.fit(
+        X_train[selected_features],
+        y_train_arr,
+        eval_set=[(X_val[selected_features], y_val_arr)],
+        callbacks=_lightgbm_callbacks(early_stopping, verbose_eval),
+    )
+
+    train_score = final_model.predict_proba(X_train[selected_features])[:, 1]
+    val_score = final_model.predict_proba(X_val[selected_features])[:, 1]
 
     threshold_metric = str(get_value(config, "modeling", "decision_threshold_metric", default="f2"))
     threshold_grid_step = float(get_value(config, "modeling", "decision_threshold_grid_step", default=0.01))
@@ -923,17 +1039,20 @@ def train_xgboost_topk_candidate(
     train_metrics = _compute_metrics(y_train, train_score, tuned_threshold)
     val_metrics = _compute_metrics(y_val, val_score, tuned_threshold)
 
-    wrapped = FeatureSubsetModel(model=model, feature_names=selected_features)
-    params_out = dict(params)
-    params_out["selected_topk_features"] = selected_features
+    wrapped = FeatureSubsetModel(model=final_model, feature_names=selected_features)
+    params_out = dict(final_params)
+    params_out["best_optuna_val_aucpr"] = float(study.best_value)
+    params_out["selected_top_k"] = int(best_top_k)
+    params_out["feature_count"] = int(len(selected_features))
+    params_out["selected_features"] = selected_features
 
     return ModelResult(
-        name="xgboost_topk",
+        name="lightgbm_optuna_topk",
         model=wrapped,
         params=params_out,
         train_metrics=train_metrics,
         val_metrics=val_metrics,
-        best_iteration=best_iter,
+        best_iteration=best_iteration,
         decision_threshold=tuned_threshold,
     )
 
@@ -1064,8 +1183,15 @@ def save_comparison_table(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     comparison.to_csv(path, index=False)
+    best = comparison.iloc[0]
     logger.info("Model comparison table saved -> %s", path)
-    logger.info("\n%s", comparison.to_string(index=False))
+    logger.info(
+        "Best validation result | model=%s | val_auc_pr=%.4f | val_recall=%.4f | threshold=%.4f",
+        best["model"],
+        float(best["val_auc_pr"]),
+        float(best["val_recall"]),
+        float(best["decision_threshold"]),
+    )
 
     return comparison
 
@@ -1104,9 +1230,9 @@ def run_training(
     Raises:
         FileNotFoundError: If the preprocessed split files are absent.
     """
-    processed_dir = project_root / "data" / "processed"
-    models_dir    = project_root / "models"
-    reports_dir   = project_root / "reports"
+    processed_dir = get_path(config, "processed_dir", base_dir=project_root)
+    models_dir = get_path(config, "models_dir", base_dir=project_root)
+    reports_dir = get_path(config, "reports_dir", base_dir=project_root)
 
     threshold: float = float(
         get_value(config, "modeling", "decision_threshold", default=0.5)
@@ -1129,10 +1255,7 @@ def run_training(
     use_optuna_candidate: bool = bool(
         get_value(config, "modeling", "use_optuna_candidate", default=True)
     )
-    use_topk_candidate: bool = bool(
-        get_value(config, "modeling", "use_topk_candidate", default=True)
-    )
-
+    _set_optuna_verbosity(config)
     # -------------------------------------------------------------------------
     # 1. Load OrdinalEncoded splits (for tree models)
     # -------------------------------------------------------------------------
@@ -1263,9 +1386,7 @@ def run_training(
             )
             continue
 
-        logger.info("=" * 60)
-        logger.info("STAGE: %s", model_name)
-        logger.info("=" * 60)
+        _log_stage(model_name)
 
         trainer_fn = trainer_map[model_name]
 
@@ -1295,11 +1416,10 @@ def run_training(
     # 3b. Advanced official candidates (Optuna + Top-K)
     # ---------------------------------------------------------------------
     xgb_base = next((r for r in all_results if r.name == "xgboost"), None)
+    lgb_base = next((r for r in all_results if r.name == "lightgbm"), None)
 
     if use_optuna_candidate and xgb_base is not None:
-        logger.info("=" * 60)
-        logger.info("STAGE: xgboost_optuna_topk")
-        logger.info("=" * 60)
+        _log_stage("xgboost_optuna_topk")
         optuna_result = train_xgboost_optuna_candidate(
             X_train,
             y_train,
@@ -1312,21 +1432,23 @@ def run_training(
         optuna_result.mlflow_run_id = _log_to_mlflow(optuna_result, experiment_name, tracking_uri)
         all_results.append(optuna_result)
 
-    if use_topk_candidate and xgb_base is not None:
-        logger.info("=" * 60)
-        logger.info("STAGE: xgboost_topk")
-        logger.info("=" * 60)
-        topk_result = train_xgboost_topk_candidate(
+    if use_optuna_candidate and lgb_base is not None:
+        _log_stage("lightgbm_optuna_topk")
+        lgb_optuna_result = train_lightgbm_optuna_topk_candidate(
             X_train,
             y_train,
             X_val,
             y_val,
             config,
-            xgb_base,
+            lgb_base,
             threshold,
         )
-        topk_result.mlflow_run_id = _log_to_mlflow(topk_result, experiment_name, tracking_uri)
-        all_results.append(topk_result)
+        lgb_optuna_result.mlflow_run_id = _log_to_mlflow(
+            lgb_optuna_result,
+            experiment_name,
+            tracking_uri,
+        )
+        all_results.append(lgb_optuna_result)
 
     if not all_results:
         raise ValueError(
@@ -1337,9 +1459,7 @@ def run_training(
     # -------------------------------------------------------------------------
     # 4. Champion selection
     # -------------------------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("STAGE: Champion Selection  (metric: val_%s)", champion_metric)
-    logger.info("=" * 60)
+    _log_stage(f"Champion Selection (metric: val_{champion_metric})")
 
     champion = select_champion(all_results, champion_metric)
 
@@ -1371,8 +1491,6 @@ def run_training(
         champion_name_path, champion.name,
     )
 
-    logger.info("=" * 60)
     logger.info("Training stage complete. Champion: %s", champion.name)
-    logger.info("=" * 60)
 
     return champion, all_results, comparison_df
