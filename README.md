@@ -18,7 +18,6 @@ Production-style machine learning pipeline for the KKBox Music Streaming Churn P
 - Multiple model families: Logistic Regression, Random Forest, XGBoost, LightGBM, and Optuna-tuned XGBoost.
 - MLflow experiment tracking for model parameters, metrics, and artifacts.
 - Champion model persisted with threshold and evaluation reports.
-- FastAPI scoring app for quick demo predictions from engineered feature CSV/JSON.
 
 ## Business Problem
 
