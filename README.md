@@ -6,7 +6,6 @@
 ![XGBoost](https://img.shields.io/badge/XGBoost-3.2-green.svg)
 ![LightGBM](https://img.shields.io/badge/LightGBM-4.6-green.svg)
 ![MLflow](https://img.shields.io/badge/MLflow-tracking-blueviolet.svg)
-![FastAPI](https://img.shields.io/badge/FastAPI-serving-teal.svg)
 ![Pytest](https://img.shields.io/badge/tests-pytest-blue.svg)
 
 Production-style machine learning pipeline for the KKBox Music Streaming Churn Prediction problem. The goal is to identify subscribers likely to churn so the business can prioritize retention campaigns before revenue is lost.
@@ -26,6 +25,41 @@ Production-style machine learning pipeline for the KKBox Music Streaming Churn P
 KKBox wants to predict whether a subscriber will fail to renew. A useful model should rank high-risk users well enough for targeted intervention, not just optimize raw accuracy on an imbalanced dataset.
 
 Primary modeling metric: **AUC-PR**, because churn is the minority class and precision-recall behavior matters more than ROC alone for campaign targeting.
+
+## Dataset
+
+The project uses the KKBox churn competition data stored locally in `data/raw/`.
+The raw files are relational and have different grains:
+
+| File | Grain | Local size | Notes |
+|---|---|---:|---|
+| `train.csv` | one labeled user row | 46.7 MB | 992,931 users with target `is_churn` |
+| `members_v3.csv` | one member profile row | 427.9 MB | 6,769,473 users with demographics and registration metadata |
+| `transactions.csv` | subscription transaction events | 1.73 GB | payment, renewal, cancellation, plan, and expiry history |
+| `user_logs.csv` | daily listening behavior events | 30.5 GB | largest table; daily play-count and listening-duration logs |
+
+Because `user_logs.csv` is too large for comfortable in-memory pandas processing,
+ingestion uses DuckDB to scan CSVs with column pruning, apply the configured
+temporal cutoff, and aggregate event tables to one row per user before writing
+compact Parquet artifacts under `data/interim/`.
+
+Current post-ingestion artifact shapes:
+
+| Artifact | Shape | Purpose |
+|---|---:|---|
+| `transactions_summary.parquet` | 2,330,992 rows x 14 cols | user-level subscription/payment summary |
+| `user_logs_summary.parquet` | 5,106,101 rows x 36 cols | user-level listening and behavior-window summary |
+| `modeling_frame.parquet` | 992,931 rows x 55 cols | labeled modeling table after joining train, members, transactions, and logs |
+| `feature_frame.parquet` | 992,931 rows x 136 cols | final engineered feature table before preprocessing |
+| `X_train.parquet` | 695,051 rows x 125 cols | model-ready training features |
+| `X_val.parquet` | 148,940 rows x 125 cols | validation features |
+| `X_test.parquet` | 148,940 rows x 125 cols | held-out test features |
+
+Temporal safety is controlled by `feature_engineering.cutoff_date` in
+`config/config.yaml`. Transaction and listening events after that cutoff are
+excluded before feature generation so the model does not learn from future
+renewal or listening activity.
+
 
 ## Current Results
 
@@ -111,7 +145,6 @@ project_churn_prediction/
 |   |-- features/
 |   |-- models/
 |   |-- utils/
-|   `-- app.py        # FastAPI demo scoring app
 |-- tests/
 |-- MODEL_CARD.md
 |-- requirements.txt
@@ -154,42 +187,6 @@ Batch scoring from an engineered feature file:
 ```powershell
 python -m src.models.score --input data/processed/feature_frame.parquet --output reports/predictions.csv
 ```
-
-Run the FastAPI demo app:
-
-```powershell
-uvicorn src.app:app --reload --host 127.0.0.1 --port 8000
-```
-
-Open:
-
-```text
-http://127.0.0.1:8000
-```
-
-The app expects rows with the engineered feature schema, such as columns from `data/processed/feature_frame.parquet`. This is intentional: online scoring should use the same preprocessor and feature contract that the model was trained on.
-
-API examples:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/predict-csv -ContentType "text/csv" -InFile sample_features.csv
-```
-
-```json
-POST /predict
-{
-  "records": [
-    {
-      "msno": "example_user",
-      "auto_renew_rate": 1.0,
-      "trans_count": 3,
-      "total_spend": 447.0
-    }
-  ]
-}
-```
-
-For JSON scoring, omitted feature columns are handled by the fitted preprocessor/model alignment where possible, but production scoring should send the full engineered schema.
 
 ## Interpretability Notes
 
