@@ -219,13 +219,16 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Project data
-data/raw/
-data/interim/
-data/processed/
+data/raw/*
+data/interim/*
+data/processed/*
 !data/.gitkeep
 !data/raw/.gitkeep
+!data/raw/.gitignore
 !data/interim/.gitkeep
+!data/interim/.gitignore
 !data/processed/.gitkeep
+!data/processed/.gitignore
 
 # Python
 venv/
